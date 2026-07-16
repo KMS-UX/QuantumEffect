@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Ambient outer glow circle -->
+    <path
+        android:fillColor="#15BC53FF"
+        android:pathData="M54,54m-38,0a38,38 0,1,1 76,0a38,38 0,1,1 -76,0" />
+
+    <!-- Quantum Ring (Neon Purple) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#BC53FF"
+        android:strokeWidth="4"
+        android:pathData="M54,54m-30,0a30,30 0,1,1 60,0a30,30 0,1,1 -60,0" />
+
+    <!-- Secondary Concentric Core Ring (Neon Blue) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M54,54m-20,0a20,20 0,1,1 40,0a20,20 0,1,1 -40,0" />
+
+    <!-- Crosshairs & Warp Coordinate Pins (High Contrast White / Cyan) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M54,20 v10 M54,78 v10 M20,54 h10 M78,54 h10" />
+
+    <!-- Center Glowing Singularity (Pure White / Cyan Glow) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,54m-7,0a7,7 0,1,1 14,0a7,7 0,1,1 -14,0" />
+    <path
+        android:fillColor="#00FF88"
+        android:pathData="M54,54m-3,0a3,3 0,1,1 6,0a3,3 0,1,1 -6,0" />
+</vector>

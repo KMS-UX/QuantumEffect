@@ -1,0 +1,6 @@
+{
+  "name": "Quantum Effect",
+  "description": "2D cyberpunk retro action RPG prototype with bio-mechanical augmentation, faction reputation systems, combat simulators, and high-thinking Gemini Storytellers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
