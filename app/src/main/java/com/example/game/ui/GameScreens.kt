@@ -1,6 +1,15 @@
 package com.example.game.ui
 
+import com.example.game.db.*
+import com.example.game.viewmodel.*
+import com.example.game.api.WebSource
+import com.example.ui.theme.*
+import com.example.game.models.*
+import androidx.compose.runtime.collectAsState
+
 import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.ui.BiasAlignment
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
@@ -20,6 +29,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -31,7 +41,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.game.api.WebSource
 import com.example.game.db.GameState
 import com.example.game.models.*
 import com.example.game.viewmodel.GameViewModel
@@ -44,6 +53,65 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.roundToInt
 import kotlin.random.Random
+import androidx.compose.runtime.saveable.rememberSaveable
+
+@Composable
+fun <T> kotlinx.coroutines.flow.StateFlow<T>.collectAsStateWithLifecycle(): androidx.compose.runtime.State<T> {
+    return this.collectAsState()
+}
+
+// --- HIGH PERFORMANCE STABILITY IMPROVEMENTS ---
+object TrigLUT {
+    private const val SIZE = 2048
+    private const val MASK = SIZE - 1
+    private val sinTable = FloatArray(SIZE)
+    private val cosTable = FloatArray(SIZE)
+    private const val RAD_TO_INDEX = SIZE / (2f * Math.PI.toFloat())
+
+    init {
+        for (i in 0 until SIZE) {
+            val angle = (i.toFloat() / SIZE) * 2f * Math.PI.toFloat()
+            sinTable[i] = kotlin.math.sin(angle)
+            cosTable[i] = kotlin.math.cos(angle)
+        }
+    }
+
+    fun sin(rad: Float): Float {
+        val wrapped = rad % (2f * Math.PI.toFloat())
+        val finalRad = if (wrapped < 0) wrapped + (2f * Math.PI.toFloat()) else wrapped
+        val index = (finalRad * RAD_TO_INDEX).toInt() and MASK
+        return sinTable[index]
+    }
+
+    fun cos(rad: Float): Float {
+        val wrapped = rad % (2f * Math.PI.toFloat())
+        val finalRad = if (wrapped < 0) wrapped + (2f * Math.PI.toFloat()) else wrapped
+        val index = (finalRad * RAD_TO_INDEX).toInt() and MASK
+        return cosTable[index]
+    }
+}
+
+class MutableNeonSpark {
+    var active: Boolean = false
+    var x: Float = 0f
+    var y: Float = 0f
+    var vx: Float = 0f
+    var vy: Float = 0f
+    var color: Color = Color.Unspecified
+    var radius: Float = 0f
+    var life: Float = 0f
+}
+
+class MutableDamageFloater {
+    var active: Boolean = false
+    var text: String = ""
+    var x: Float = 0f
+    var y: Float = 0f
+    var color: Color = Color.Unspecified
+    var scale: Float = 1f
+    var life: Float = 0f
+}
+
 
 // --- SCREEN 1: EXPLORE (INTERACTIVE MAP & ISOMETRIC PLAYGROUND) ---
 
@@ -66,7 +134,9 @@ data class IsoParticle(
     val color: Color,
     val size: Float,
     var alpha: Float = 1f,
-    var life: Int = 30
+    var life: Int = 30,
+    var isPlayerProjectile: Boolean = false,
+    var isQuantumAbility: Boolean = false
 )
 
 data class IsoCollectible(
@@ -237,7 +307,7 @@ fun ExploreScreen(
     onNavigateToCombat: () -> Unit
 ) {
     val coroutineScope = rememberCoroutineScope()
-    val activeCompanionName by viewModel.activeCompanionName.collectAsState()
+    val activeCompanionName by viewModel.activeCompanionName.collectAsStateWithLifecycle()
     var activeMode by remember { mutableStateOf(0) } // 0 = Isometric RPG, 1 = Grid Coordinates
     var selectedBiome by remember { mutableStateOf(Biome.GRASSLANDS) }
     
@@ -254,6 +324,8 @@ fun ExploreScreen(
     // Dynamic obstacle & interaction lists
     val obstacles = remember { mutableStateListOf<IsoObstacle>() }
     var activeInteractedStructure by remember { mutableStateOf<IsoObstacle?>(null) }
+    var activeNpcDialogue by remember { mutableStateOf<IsoObstacle?>(null) }
+    var activeDialogueText by remember { mutableStateOf("") }
     val activeConsoleNearby = remember(playerX, playerY, obstacles) {
         obstacles.firstOrNull { 
             it.interactable && !it.isDestroyed && 
@@ -281,6 +353,143 @@ fun ExploreScreen(
     LaunchedEffect(gameState.health) {
         localPlayerHp = gameState.health
     }
+
+    // Helper: Handle enemy defeat loot drops and rewards
+    val handleEnemyDefeat: (IsoEnemy) -> Unit = { enemy ->
+        // Burst particles
+        for (i in 0..15) {
+            particles.add(
+                IsoParticle(
+                    x = enemy.x,
+                    y = enemy.y,
+                    vx = Random.nextFloat() * 200f - 100f,
+                    vy = Random.nextFloat() * 200f - 100f,
+                    color = QuantumNeonOrange,
+                    size = 9f,
+                    life = 20
+                )
+            )
+        }
+        
+        // Spawn Standard Drops
+        collectibles.add(
+            IsoCollectible(
+                id = System.nanoTime(),
+                type = "Credits",
+                x = enemy.x,
+                y = enemy.y,
+                amount = Random.nextInt(120, 260),
+                symbol = "💎"
+            )
+        )
+        collectibles.add(
+            IsoCollectible(
+                id = System.nanoTime() + 2,
+                type = "Nanites",
+                x = enemy.x + 12f,
+                y = enemy.y - 12f,
+                amount = Random.nextInt(30, 60),
+                symbol = "⚡"
+            )
+        )
+        
+        // --- 20% Chance to Drop EQUIPABLE GEAR ---
+        if (Random.nextFloat() < 0.20f) {
+            val gearType = Random.nextInt(0, 5)
+            val gearCollectible = when (gearType) {
+                0 -> IsoCollectible(System.nanoTime() + 5, "Titanium Exo-Plate", enemy.x - 12f, enemy.y + 12f, 1, "🛡️")
+                1 -> IsoCollectible(System.nanoTime() + 5, "Hyper-Actuator Gauntlet", enemy.x - 12f, enemy.y + 12f, 1, "⚔️")
+                2 -> IsoCollectible(System.nanoTime() + 5, "Vortex Mana Capacitor", enemy.x - 12f, enemy.y + 12f, 1, "🧪")
+                3 -> IsoCollectible(System.nanoTime() + 5, "Scavenger Scrap Sabot", enemy.x - 12f, enemy.y + 12f, 1, "⚙️")
+                else -> IsoCollectible(System.nanoTime() + 5, "Reflex Synapse Chip", enemy.x - 12f, enemy.y + 12f, 1, "🧠")
+            }
+            collectibles.add(gearCollectible)
+            
+            // Add a floaty indicator for the gear drop
+            damageNumbers.add(
+                IsoDamageNumber(
+                    id = System.nanoTime() + 10,
+                    text = "⭐ RARE GEAR DROP! ⭐",
+                    x = enemy.x,
+                    y = enemy.y - 25f,
+                    color = QuantumNeonOrange
+                )
+            )
+        }
+        
+        viewModel.addResources(100, 20, 150)
+        
+        damageNumbers.add(
+            IsoDamageNumber(
+                id = System.nanoTime() + 3,
+                text = "+150 XP",
+                x = playerX,
+                y = playerY - 30f,
+                color = QuantumNeonBlue
+            )
+        )
+    }
+
+    // Helper: Handle crate destruction loot drops and rewards
+    val handleCrateDestruction: (IsoObstacle) -> Unit = { obs ->
+        obs.isDestroyed = true
+        // Explosion particles!
+        for (i in 0..12) {
+            particles.add(
+                IsoParticle(
+                    x = obs.x,
+                    y = obs.y,
+                    vx = Random.nextFloat() * 160f - 80f,
+                    vy = Random.nextFloat() * 160f - 80f,
+                    color = QuantumNeonOrange,
+                    size = 8f,
+                    life = 18
+                )
+            )
+        }
+        
+        // Drop collectibles
+        collectibles.add(
+            IsoCollectible(
+                id = System.nanoTime(),
+                type = "Credits",
+                x = obs.x,
+                y = obs.y,
+                amount = Random.nextInt(80, 180),
+                symbol = "💎"
+            )
+        )
+        collectibles.add(
+            IsoCollectible(
+                id = System.nanoTime() + 1,
+                type = "Nanites",
+                x = obs.x + 10f,
+                y = obs.y - 10f,
+                amount = Random.nextInt(15, 35),
+                symbol = "⚡"
+            )
+        )
+        
+        // 15% Chance to drop high-tier consumables!
+        if (Random.nextFloat() < 0.15f) {
+            val consumableCollectible = if (Random.nextBoolean()) {
+                IsoCollectible(System.nanoTime() + 6, "Nanotech Med-Inject", obs.x - 10f, obs.y + 10f, 1, "💉")
+            } else {
+                IsoCollectible(System.nanoTime() + 6, "Quantum Fusion Cell", obs.x - 10f, obs.y + 10f, 1, "🔋")
+            }
+            collectibles.add(consumableCollectible)
+        }
+        
+        damageNumbers.add(
+            IsoDamageNumber(
+                id = System.nanoTime() + 3,
+                text = "${obs.name} SECURED",
+                x = obs.x,
+                y = obs.y - 25f,
+                color = QuantumNeonGreen
+            )
+        )
+    }
     
     // Biome Teleportation initialization
     LaunchedEffect(selectedBiome, gameState.deployedStructures) {
@@ -292,48 +501,84 @@ fun ExploreScreen(
         obstacles.clear()
         
         // Seed Biome Obstacles & Interactive Objects from Master Tileset
-        val themeColor = selectedBiome.color
+        val themeColor = Color(selectedBiome.color)
         when (selectedBiome) {
             Biome.GRASSLANDS -> {
                 obstacles.add(IsoObstacle(1, "COLUMN", 110f, 150f, 18f, themeColor, name = "Aurelian Column"))
                 obstacles.add(IsoObstacle(2, "COLUMN", 290f, 260f, 18f, themeColor, name = "Aurelian Column"))
                 obstacles.add(IsoObstacle(3, "CONSOLE", 200f, 120f, 20f, QuantumNeonBlue, name = "Aurelian Core Terminal", interactable = true))
-                obstacles.add(IsoObstacle(4, "CRATE", 150f, 240f, 15f, QuantumNeonOrange, isDestructible = true, name = "Scrapyard Cache", hp = 60))
-                obstacles.add(IsoObstacle(5, "CRATE", 260f, 160f, 15f, QuantumNeonOrange, isDestructible = true, name = "Aurelian Secure Crate", hp = 80))
+                obstacles.add(IsoObstacle(4, "CRATE", 150f, 240f, 15f, QuantumNeonOrange, isDestructible = true, name = "Scrapyard Cache", hp = 60, interactable = true))
+                obstacles.add(IsoObstacle(5, "CRATE", 260f, 160f, 15f, QuantumNeonOrange, isDestructible = true, name = "Aurelian Secure Crate", hp = 80, interactable = true))
                 obstacles.add(IsoObstacle(6, "HOLOGRAPHIC_SIGN", 130f, 290f, 12f, themeColor, name = "Aurelian Ad-Sign"))
+                
+                // Default NPCs, Containers, Doors
+                obstacles.add(IsoObstacle(11, "NPC_GUARD", 140f, 100f, 15f, QuantumNeonBlue, name = "Sector Aegis Guard", interactable = true))
+                obstacles.add(IsoObstacle(12, "NPC_MERCHANT", 260f, 320f, 15f, QuantumNeonGreen, name = "Infoband Merchant", interactable = true))
+                obstacles.add(IsoObstacle(21, "CONTAINER", 150f, 180f, 15f, QuantumNeonGreen, name = "Cargo Cache", interactable = true))
+                obstacles.add(IsoObstacle(22, "DOOR", 200f, 340f, 16f, QuantumNeonPurple, name = "Secure Transit Gate", interactable = true))
             }
             Biome.SNOW -> {
                 obstacles.add(IsoObstacle(1, "ICE_CRYSTAL", 120f, 140f, 16f, themeColor, name = "Cryo Crystal Shard"))
                 obstacles.add(IsoObstacle(2, "ICE_CRYSTAL", 280f, 280f, 16f, themeColor, name = "Cryo Crystal Shard"))
                 obstacles.add(IsoObstacle(3, "CONSOLE", 180f, 150f, 20f, QuantumNeonBlue, name = "Cryogenic Console", interactable = true))
-                obstacles.add(IsoObstacle(4, "CRATE", 140f, 220f, 15f, QuantumNeonBlue, isDestructible = true, name = "Frozen Nanite Pod", hp = 50))
-                obstacles.add(IsoObstacle(5, "CRATE", 240f, 180f, 15f, QuantumNeonBlue, isDestructible = true, name = "Sub-Zero Supply Box", hp = 50))
+                obstacles.add(IsoObstacle(4, "CRATE", 140f, 220f, 15f, QuantumNeonBlue, isDestructible = true, name = "Frozen Nanite Pod", hp = 50, interactable = true))
+                obstacles.add(IsoObstacle(5, "CRATE", 240f, 180f, 15f, QuantumNeonBlue, isDestructible = true, name = "Sub-Zero Supply Box", hp = 50, interactable = true))
                 obstacles.add(IsoObstacle(6, "COLUMN", 200f, 310f, 18f, themeColor, name = "Cryo Pylon"))
+                
+                // Default NPCs, Containers, Doors
+                obstacles.add(IsoObstacle(11, "NPC_CHEMIST", 120f, 260f, 15f, QuantumNeonBlue, name = "Nanite Alchemist", interactable = true))
+                obstacles.add(IsoObstacle(21, "CONTAINER", 150f, 100f, 15f, QuantumNeonBlue, name = "Sub-Zero Crypt Vault", interactable = true))
             }
             Biome.DESERT -> {
                 obstacles.add(IsoObstacle(1, "COLUMN", 150f, 110f, 18f, themeColor, name = "Rusty Hydro-Pipe Column"))
                 obstacles.add(IsoObstacle(2, "COLUMN", 250f, 310f, 18f, themeColor, name = "Emberfall Pylon"))
                 obstacles.add(IsoObstacle(3, "CONSOLE", 200f, 180f, 20f, QuantumNeonOrange, name = "Scavenger Solar Deck", interactable = true))
-                obstacles.add(IsoObstacle(4, "CRATE", 110f, 250f, 15f, QuantumNeonOrange, isDestructible = true, name = "Sustenance Drum", hp = 70))
-                obstacles.add(IsoObstacle(5, "CRATE", 310f, 130f, 15f, QuantumNeonOrange, isDestructible = true, name = "Scattered Alloy Salvage", hp = 60))
+                obstacles.add(IsoObstacle(4, "CRATE", 110f, 250f, 15f, QuantumNeonOrange, isDestructible = true, name = "Sustenance Drum", hp = 70, interactable = true))
+                obstacles.add(IsoObstacle(5, "CRATE", 310f, 130f, 15f, QuantumNeonOrange, isDestructible = true, name = "Scattered Alloy Salvage", hp = 60, interactable = true))
+                
+                // Default NPCs, Containers, Doors
+                obstacles.add(IsoObstacle(11, "NPC_ROGUE", 280f, 160f, 15f, QuantumNeonOrange, name = "Desert Outlaw", interactable = true))
+                obstacles.add(IsoObstacle(21, "CONTAINER", 180f, 290f, 15f, QuantumNeonOrange, name = "Scavenger Junk Safe", interactable = true))
             }
             Biome.VOLCANIC -> {
                 obstacles.add(IsoObstacle(1, "LAVA_VENT", 130f, 160f, 18f, themeColor, name = "Thermal Vent"))
                 obstacles.add(IsoObstacle(2, "LAVA_VENT", 270f, 240f, 18f, themeColor, name = "Thermal Vent"))
                 obstacles.add(IsoObstacle(3, "CONSOLE", 160f, 250f, 20f, QuantumNeonRed, name = "Magma Power Grid Terminal", interactable = true))
-                obstacles.add(IsoObstacle(4, "CRATE", 180f, 110f, 15f, themeColor, isDestructible = true, name = "Reinforced Pyroxene Vault", hp = 100))
-                obstacles.add(IsoObstacle(5, "CRATE", 220f, 290f, 15f, themeColor, isDestructible = true, name = "Thermal Battery Block", hp = 80))
+                obstacles.add(IsoObstacle(4, "CRATE", 180f, 110f, 15f, themeColor, isDestructible = true, name = "Reinforced Pyroxene Vault", hp = 100, interactable = true))
+                obstacles.add(IsoObstacle(5, "CRATE", 220f, 290f, 15f, themeColor, isDestructible = true, name = "Thermal Battery Block", hp = 80, interactable = true))
                 obstacles.add(IsoObstacle(6, "COLUMN", 100f, 220f, 18f, themeColor, name = "Forge Core Reactor"))
+                
+                // Default NPCs, Containers, Doors
+                obstacles.add(IsoObstacle(11, "NPC_GUARD", 100f, 220f, 15f, QuantumNeonRed, name = "Magma Heavy Exo", interactable = true))
+                obstacles.add(IsoObstacle(21, "CONTAINER", 300f, 150f, 15f, QuantumNeonRed, name = "Magma Core Chest", interactable = true))
             }
             Biome.RUINS, Biome.VOID_SEA -> {
                 obstacles.add(IsoObstacle(1, "COLUMN", 120f, 120f, 18f, themeColor, name = "Void Rift Obelisk"))
                 obstacles.add(IsoObstacle(2, "COLUMN", 280f, 280f, 18f, themeColor, name = "Void Rift Obelisk"))
                 obstacles.add(IsoObstacle(3, "CONSOLE", 200f, 190f, 20f, QuantumNeonPurple, name = "Reality Anchor Interface", interactable = true))
-                obstacles.add(IsoObstacle(4, "CRATE", 150f, 260f, 15f, QuantumNeonPurple, isDestructible = true, name = "Void Catalyst Vessel", hp = 60))
-                obstacles.add(IsoObstacle(5, "CRATE", 250f, 110f, 15f, QuantumNeonPurple, isDestructible = true, name = "Rift Energy Containment Cell", hp = 70))
+                obstacles.add(IsoObstacle(4, "CRATE", 150f, 260f, 15f, QuantumNeonPurple, isDestructible = true, name = "Void Catalyst Vessel", hp = 60, interactable = true))
+                obstacles.add(IsoObstacle(5, "CRATE", 250f, 110f, 15f, QuantumNeonPurple, isDestructible = true, name = "Rift Energy Containment Cell", hp = 70, interactable = true))
                 obstacles.add(IsoObstacle(6, "HOLOGRAPHIC_SIGN", 100f, 210f, 12f, themeColor, name = "Singularity Marker"))
+                
+                // Default NPCs, Containers, Doors
+                obstacles.add(IsoObstacle(11, "NPC_EXPLORER", 100f, 210f, 15f, QuantumNeonPurple, name = "Chronos Nomad", interactable = true))
+                obstacles.add(IsoObstacle(21, "CONTAINER", 300f, 250f, 15f, QuantumNeonPurple, name = "Ruin Relic Sarcophagus", interactable = true))
             }
         }
+
+        // Always place a Quantum Gate on the map for parallel earth discovery!
+        obstacles.add(
+            IsoObstacle(
+                id = 100,
+                type = "QUANTUM_GATE",
+                x = 220f,
+                y = 220f,
+                radius = 22f,
+                color = QuantumNeonPurple,
+                name = "Singularium Quantum Gate",
+                interactable = true
+            )
+        )
         
         // Spawn 4 enemies matching biome
         val enemyColors = when (selectedBiome) {
@@ -612,13 +857,164 @@ fun ExploreScreen(
                     
                     if (p.life <= 0 || p.alpha <= 0f) {
                         pIter.remove()
+                    } else if (p.isPlayerProjectile) {
+                        var hitSomething = false
+                        
+                        // 1. Check hitting enemies
+                        val eIter = enemies.iterator()
+                        while (eIter.hasNext()) {
+                            val enemy = eIter.next()
+                            val edx = enemy.x - p.x
+                            val edy = enemy.y - p.y
+                            val edist = sqrt(edx * edx + edy * edy)
+                            if (edist < 22f) {
+                                hitSomething = true
+                                enemy.hitCooldown = 12
+                                enemy.state = "HIT"
+                                
+                                val damage = ((gameState.currentWeapon.baseAtk + gameState.totalAtkBonus) * (1f + gameState.level * 0.12f)).toInt() + Random.nextInt(-6, 8)
+                                enemy.hp = (enemy.hp - damage).coerceAtLeast(0)
+                                
+                                damageNumbers.add(
+                                    IsoDamageNumber(
+                                        id = System.nanoTime(),
+                                        text = "🎯 $damage",
+                                        x = enemy.x,
+                                        y = enemy.y - 12f,
+                                        color = p.color
+                                    )
+                                )
+                                
+                                // Splash particles on hit
+                                for (k in 0..5) {
+                                    particles.add(
+                                        IsoParticle(
+                                            x = enemy.x,
+                                            y = enemy.y,
+                                            vx = Random.nextFloat() * 120f - 60f,
+                                            vy = Random.nextFloat() * 120f - 60f,
+                                            color = p.color,
+                                            size = 4f,
+                                            life = 10
+                                        )
+                                    )
+                                }
+                                
+                                if (enemy.hp <= 0) {
+                                    eIter.remove()
+                                    handleEnemyDefeat(enemy)
+                                }
+                                break
+                            }
+                        }
+                        
+                        if (!hitSomething) {
+                            // 2. Check hitting destructible obstacles
+                            for (obs in obstacles) {
+                                if (obs.isDestructible && !obs.isDestroyed) {
+                                    val odx = obs.x - p.x
+                                    val ody = obs.y - p.y
+                                    val odist = sqrt(odx * odx + ody * ody)
+                                    if (odist < 22f) {
+                                        hitSomething = true
+                                        val damage = ((gameState.currentWeapon.baseAtk + gameState.totalAtkBonus) * (1f + gameState.level * 0.12f)).toInt() + Random.nextInt(-4, 6)
+                                        obs.hp = (obs.hp - damage).coerceAtLeast(0)
+                                        
+                                        // spark hit particles
+                                        for (k in 0..4) {
+                                            particles.add(
+                                                IsoParticle(p.x, p.y, Random.nextFloat() * 80f - 40f, Random.nextFloat() * 80f - 40f, obs.color, 4f, 1f, 10)
+                                            )
+                                        }
+                                        
+                                        damageNumbers.add(IsoDamageNumber(System.nanoTime(), "💥 $damage", obs.x, obs.y - 12f, obs.color))
+                                        
+                                        if (obs.hp <= 0) {
+                                            handleCrateDestruction(obs)
+                                        }
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if (!hitSomething) {
+                            // 3. Check hitting wildlife
+                            val wIter = wildlifeList.iterator()
+                            while (wIter.hasNext()) {
+                                val wildlife = wIter.next()
+                                val wdx = wildlife.x - p.x
+                                val wdy = wildlife.y - p.y
+                                val wdist = sqrt(wdx * wdx + wdy * wdy)
+                                if (wdist < 22f) {
+                                    hitSomething = true
+                                    wildlife.hitCooldown = 15
+                                    
+                                    val dropItem = wildlife.drops.randomOrNull() ?: "Biomass"
+                                    val creditReward = when (wildlife.rarity) {
+                                        "Common" -> Random.nextInt(40, 85)
+                                        "Rare" -> Random.nextInt(90, 160)
+                                        "Epic" -> Random.nextInt(200, 350)
+                                        else -> Random.nextInt(400, 800)
+                                    }
+                                    val xpReward = when (wildlife.rarity) {
+                                        "Common" -> 50
+                                        "Rare" -> 120
+                                        "Epic" -> 250
+                                        else -> 500
+                                    }
+                                    
+                                    for (k in 0..6) {
+                                        particles.add(IsoParticle(wildlife.x, wildlife.y, Random.nextFloat() * 100f - 50f, Random.nextFloat() * 100f - 50f, wildlife.color, 5f, 1f, 12))
+                                    }
+                                    
+                                    damageNumbers.add(IsoDamageNumber(System.nanoTime(), "💥 Harvest: $dropItem", wildlife.x, wildlife.y - 12f, QuantumNeonGreen))
+                                    damageNumbers.add(IsoDamageNumber(System.nanoTime() + 1, "+$creditReward Credits", wildlife.x, wildlife.y - 28f, QuantumNeonOrange))
+                                    damageNumbers.add(IsoDamageNumber(System.nanoTime() + 2, "+$xpReward XP", playerX, playerY - 30f, QuantumNeonBlue))
+                                    
+                                    collectibles.add(
+                                        IsoCollectible(
+                                            id = System.nanoTime() + 3,
+                                            type = dropItem,
+                                            x = wildlife.x,
+                                            y = wildlife.y,
+                                            amount = when (wildlife.rarity) {
+                                                "Common" -> Random.nextInt(1, 3)
+                                                "Rare" -> Random.nextInt(3, 6)
+                                                "Epic" -> Random.nextInt(5, 10)
+                                                else -> Random.nextInt(10, 20)
+                                            },
+                                            symbol = "📦"
+                                        )
+                                    )
+                                    
+                                    viewModel.addResources(creditReward, xpReward / 4, xpReward)
+                                    wIter.remove()
+                                    break
+                                }
+                            }
+                        }
+                        
+                        if (hitSomething) {
+                            pIter.remove()
+                        }
                     } else if (p.color == QuantumNeonRed) { // Enemy hostile projectle
                         val dx = playerX - p.x
                         val dy = playerY - p.y
                         val dist = sqrt(dx * dx + dy * dy)
                         if (dist < 18f) {
                             pIter.remove()
-                            if (shieldActiveTime > 0) {
+                            if (dashActiveTime > 0) {
+                                damageNumbers.add(
+                                    IsoDamageNumber(
+                                        id = System.nanoTime(),
+                                        text = "DODGED",
+                                        x = playerX,
+                                        y = playerY - 10f,
+                                        color = QuantumNeonBlue
+                                    )
+                                )
+                            } else if (shieldActiveTime > 0) {
                                 damageNumbers.add(
                                     IsoDamageNumber(
                                         id = System.nanoTime(),
@@ -631,6 +1027,7 @@ fun ExploreScreen(
                             } else {
                                 val damageVal = Random.nextInt(15, 30)
                                 localPlayerHp = (localPlayerHp - damageVal).coerceAtLeast(0)
+                                viewModel.updatePlayerHealth(localPlayerHp)
                                 damageNumbers.add(
                                     IsoDamageNumber(
                                         id = System.nanoTime(),
@@ -658,6 +1055,7 @@ fun ExploreScreen(
                                 if (localPlayerHp == 0) {
                                     // Respawn reboot
                                     localPlayerHp = gameState.maxHealth
+                                    viewModel.updatePlayerHealth(localPlayerHp)
                                     playerX = 200f
                                     playerY = 200f
                                     damageNumbers.add(
@@ -710,9 +1108,27 @@ fun ExploreScreen(
                         cIter.remove()
                         
                         val credGain = if (item.type == "Credits") item.amount else 0
-                        val naniteGain = if (item.type == "Credits") 0 else item.amount / 3
+                        val naniteGain = if (item.type == "Nanites") item.amount else 0
                         
-                        viewModel.addResources(credits = credGain, nanites = naniteGain, xp = 10)
+                        if (credGain > 0 || naniteGain > 0) {
+                            viewModel.addResources(credGain, naniteGain, 10)
+                        } else {
+                            val category = when (item.type) {
+                                "Scrap Metal", "Alloy Plate" -> "Scrap"
+                                "Lava Core", "Voidium", "Singularium", "Crystal", "Rare Gem" -> "Mineral"
+                                "Meat" -> "Food"
+                                "Herb", "Venom", "Mushroom Essence", "Glow Essence" -> "Medicine"
+                                "Hide", "Bone", "Shell", "Needle", "Feather", "Biomass", "Nano Fiber" -> "Crafting Material"
+                                else -> "Crafting Material"
+                            }
+                            viewModel.addItemToInventory(
+                                item.type,
+                                category,
+                                item.symbol,
+                                item.amount,
+                                "Salvaged $category: ${item.type} harvested from the wild."
+                            )
+                        }
                         
                         damageNumbers.add(
                             IsoDamageNumber(
@@ -928,32 +1344,71 @@ fun ExploreScreen(
                                     wildlife.x = testWX.coerceIn(30f, 370f)
                                     wildlife.y = testWY.coerceIn(30f, 370f)
                                 }
-                                if (dist < 18f && ticks % 40 == 0 && shieldActiveTime == 0) {
-                                    // Attacks the player!
-                                    val dmg = Random.nextInt(4, 9)
-                                    localPlayerHp = (localPlayerHp - dmg).coerceAtLeast(0)
-                                    damageNumbers.add(
-                                        IsoDamageNumber(
-                                            id = System.nanoTime(),
-                                            text = "-$dmg HP",
-                                            x = playerX,
-                                            y = playerY - 10f,
-                                            color = QuantumNeonRed
-                                        )
-                                    )
-                                    // red burst particles
-                                    for (k in 0..3) {
-                                        particles.add(
-                                            IsoParticle(
+                                if (dist < 18f && ticks % 40 == 0) {
+                                    if (dashActiveTime > 0) {
+                                        damageNumbers.add(
+                                            IsoDamageNumber(
+                                                id = System.nanoTime(),
+                                                text = "DODGED",
                                                 x = playerX,
-                                                y = playerY,
-                                                vx = Random.nextFloat() * 60f - 30f,
-                                                vy = Random.nextFloat() * 60f - 30f,
-                                                color = QuantumNeonRed,
-                                                size = 6f,
-                                                life = 10
+                                                y = playerY - 10f,
+                                                color = QuantumNeonBlue
                                             )
                                         )
+                                    } else if (shieldActiveTime > 0) {
+                                        damageNumbers.add(
+                                            IsoDamageNumber(
+                                                id = System.nanoTime(),
+                                                text = "BLOCKED",
+                                                x = playerX,
+                                                y = playerY - 10f,
+                                                color = QuantumNeonGreen
+                                            )
+                                        )
+                                    } else {
+                                        // Attacks the player!
+                                        val dmg = Random.nextInt(4, 9)
+                                        localPlayerHp = (localPlayerHp - dmg).coerceAtLeast(0)
+                                        viewModel.updatePlayerHealth(localPlayerHp)
+                                        damageNumbers.add(
+                                            IsoDamageNumber(
+                                                id = System.nanoTime(),
+                                                text = "-$dmg HP",
+                                                x = playerX,
+                                                y = playerY - 10f,
+                                                color = QuantumNeonRed
+                                            )
+                                        )
+                                        // red burst particles
+                                        for (k in 0..3) {
+                                            particles.add(
+                                                IsoParticle(
+                                                    x = playerX,
+                                                    y = playerY,
+                                                    vx = Random.nextFloat() * 60f - 30f,
+                                                    vy = Random.nextFloat() * 60f - 30f,
+                                                    color = QuantumNeonRed,
+                                                    size = 6f,
+                                                    life = 10
+                                                )
+                                            )
+                                        }
+                                        
+                                        if (localPlayerHp == 0) {
+                                            localPlayerHp = gameState.maxHealth
+                                            viewModel.updatePlayerHealth(localPlayerHp)
+                                            playerX = 200f
+                                            playerY = 200f
+                                            damageNumbers.add(
+                                                IsoDamageNumber(
+                                                    id = System.nanoTime(),
+                                                    text = "REBOOT",
+                                                    x = 200f,
+                                                    y = 200f,
+                                                    color = QuantumNeonPurple
+                                                )
+                                            )
+                                        }
                                     }
                                 }
                             } else {
@@ -997,308 +1452,676 @@ fun ExploreScreen(
                         }
                     }
                 }
-                
+
+                // 8. Custom Deployed Props & NPCs Real-time Kotlin Behaviors (Converted from Godot GDScript templates)
+                obstacles.forEach { obs ->
+                    if (!obs.isDestroyed) {
+                        if (obs.type.startsWith("PROP_")) {
+                            when (obs.type) {
+                                "PROP_COOLING_CORE" -> {
+                                    if (ticks % 35 == 0) {
+                                        particles.add(
+                                            IsoParticle(
+                                                x = obs.x + Random.nextFloat() * 10f - 5f,
+                                                y = obs.y - 15f,
+                                                vx = Random.nextFloat() * 16f - 8f,
+                                                vy = -20f - Random.nextFloat() * 15f,
+                                                color = obs.color,
+                                                size = 3.5f,
+                                                life = 20
+                                            )
+                                        )
+                                    }
+                                    val dx = playerX - obs.x
+                                    val dy = playerY - obs.y
+                                    val dist = sqrt(dx * dx + dy * dy)
+                                    if (dist < 40f && ticks % 60 == 0 && localPlayerHp < gameState.maxHealth) {
+                                        localPlayerHp = (localPlayerHp + 2).coerceAtMost(gameState.maxHealth)
+                                        viewModel.updatePlayerHealth(localPlayerHp)
+                                        particles.add(IsoParticle(playerX, playerY - 10f, 0f, -25f, QuantumNeonGreen, 4f, 1f, 15))
+                                    }
+                                }
+                                "PROP_TELEMETRY_DISH" -> {
+                                    if (ticks % 60 == 0) {
+                                        for (i in 0..7) {
+                                            val angle = i * (6.28318f / 8f)
+                                            particles.add(
+                                                IsoParticle(
+                                                    x = obs.x,
+                                                    y = obs.y - 20f,
+                                                    vx = cos(angle) * 40f,
+                                                    vy = sin(angle) * 20f,
+                                                    color = obs.color.copy(alpha = 0.8f),
+                                                    size = 3f,
+                                                    life = 30
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                                "PROP_WAYFINDER" -> {
+                                    if (ticks % 25 == 0) {
+                                        particles.add(
+                                            IsoParticle(
+                                                x = obs.x,
+                                                y = obs.y - 32f,
+                                                vx = 0f,
+                                                vy = -35f,
+                                                color = obs.color,
+                                                size = 4f,
+                                                life = 15
+                                            )
+                                        )
+                                    }
+                                }
+                                "PROP_VOID_OBELISK" -> {
+                                    if (ticks % 50 == 0) {
+                                        enemies.forEach { enemy ->
+                                            if (enemy.hp > 0) {
+                                                val edx = obs.x - enemy.x
+                                                val edy = obs.y - enemy.y
+                                                val edist = sqrt(edx * edx + edy * edy)
+                                                if (edist < 110f) {
+                                                    enemy.x += (edx / edist) * 15f
+                                                    enemy.y += (edy / edist) * 15f
+                                                    val dmg = 6
+                                                    enemy.hp = (enemy.hp - dmg).coerceAtLeast(0)
+                                                    
+                                                    damageNumbers.add(
+                                                        IsoDamageNumber(
+                                                            id = System.nanoTime() + enemy.id,
+                                                            text = "-$dmg Void",
+                                                            x = enemy.x,
+                                                            y = enemy.y - 12f,
+                                                            color = obs.color
+                                                        )
+                                                    )
+                                                    
+                                                    for (step in 0..6) {
+                                                        val t = step / 6f
+                                                        particles.add(
+                                                            IsoParticle(
+                                                                x = obs.x * (1f - t) + enemy.x * t,
+                                                                y = (obs.y - 45f) * (1f - t) + enemy.y * t,
+                                                                vx = 0f,
+                                                                vy = 0f,
+                                                                color = obs.color,
+                                                                size = 4f,
+                                                                life = 6
+                                                            )
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "PROP_VOLATILE_DRUM" -> {
+                                    if (ticks % 15 == 0) {
+                                        enemies.forEach { enemy ->
+                                            if (enemy.hp > 0) {
+                                                val edx = obs.x - enemy.x
+                                                val edy = obs.y - enemy.y
+                                                val edist = sqrt(edx * edx + edy * edy)
+                                                if (edist < 22f) {
+                                                    obs.isDestroyed = true
+                                                    enemies.forEach { nearEnemy ->
+                                                        if (nearEnemy.hp > 0) {
+                                                            val ndx = obs.x - nearEnemy.x
+                                                            val ndy = obs.y - nearEnemy.y
+                                                            val ndist = sqrt(ndx * ndx + ndy * ndy)
+                                                            if (ndist < 75f) {
+                                                                val dmg = 45
+                                                                nearEnemy.hp = (nearEnemy.hp - dmg).coerceAtLeast(0)
+                                                                nearEnemy.x -= (ndx / ndist) * 35f
+                                                                nearEnemy.y -= (ndy / ndist) * 35f
+                                                                
+                                                                damageNumbers.add(
+                                                                    IsoDamageNumber(
+                                                                        id = System.nanoTime() + nearEnemy.id,
+                                                                        text = "EXPLOSION -$dmg HP",
+                                                                        x = nearEnemy.x,
+                                                                        y = nearEnemy.y - 12f,
+                                                                        color = QuantumNeonOrange
+                                                                    )
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    for (k in 0..16) {
+                                                        val angle = k * (6.28318f / 17f)
+                                                        val pSpeed = 60f + Random.nextFloat() * 40f
+                                                        particles.add(
+                                                            IsoParticle(
+                                                                x = obs.x,
+                                                                y = obs.y - 10f,
+                                                                vx = cos(angle) * pSpeed,
+                                                                vy = sin(angle) * pSpeed * 0.5f - 20f,
+                                                                color = QuantumNeonOrange,
+                                                                size = 7f,
+                                                                life = 25
+                                                            )
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (obs.type.startsWith("NPC_")) {
+                            when (obs.type) {
+                                "NPC_COMPANION_ENG" -> {
+                                    val dx = playerX - obs.x
+                                    val dy = playerY - obs.y
+                                    val dist = sqrt(dx * dx + dy * dy)
+                                    if (dist > 45f) {
+                                        val moveSpeed = 35f
+                                        obs.x += (dx / dist) * moveSpeed * delta
+                                        obs.y += (dy / dist) * moveSpeed * delta
+                                    }
+                                    if (ticks % 90 == 0 && localPlayerHp < gameState.maxHealth && dist < 120f) {
+                                        val healAmount = 10
+                                        localPlayerHp = (localPlayerHp + healAmount).coerceAtMost(gameState.maxHealth)
+                                        viewModel.updatePlayerHealth(localPlayerHp)
+                                        
+                                        damageNumbers.add(
+                                            IsoDamageNumber(
+                                                id = System.nanoTime() + obs.id,
+                                                text = "+$healAmount HP Nano-Repair",
+                                                x = playerX,
+                                                y = playerY - 15f,
+                                                color = QuantumNeonGreen
+                                            )
+                                        )
+                                        
+                                        for (i in 0..5) {
+                                            particles.add(
+                                                IsoParticle(
+                                                    x = playerX + Random.nextFloat() * 20f - 10f,
+                                                    y = playerY - Random.nextFloat() * 20f,
+                                                    vx = Random.nextFloat() * 10f - 5f,
+                                                    vy = -20f - Random.nextFloat() * 10f,
+                                                    color = QuantumNeonGreen,
+                                                    size = 4f,
+                                                    life = 15
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                                "NPC_GUARD" -> {
+                                    if (ticks % 40 == 0) {
+                                        var targetEnemy: IsoEnemy? = null
+                                        var closestDist = 135f
+                                        enemies.forEach { enemy ->
+                                            if (enemy.hp > 0) {
+                                                val edx = enemy.x - obs.x
+                                                val edy = enemy.y - obs.y
+                                                val edist = sqrt(edx * edx + edy * edy)
+                                                if (edist < closestDist) {
+                                                    closestDist = edist
+                                                    targetEnemy = enemy
+                                                }
+                                            }
+                                        }
+                                        
+                                        targetEnemy?.let { enemy ->
+                                            val dmg = 15
+                                            enemy.hp = (enemy.hp - dmg).coerceAtLeast(0)
+                                            
+                                            damageNumbers.add(
+                                                IsoDamageNumber(
+                                                    id = System.nanoTime() + enemy.id,
+                                                    text = "-$dmg Guard Blaster",
+                                                    x = enemy.x,
+                                                    y = enemy.y - 12f,
+                                                    color = obs.color
+                                                )
+                                            )
+                                            
+                                            for (step in 0..5) {
+                                                val t = step / 5f
+                                                particles.add(
+                                                    IsoParticle(
+                                                        x = obs.x * (1f - t) + enemy.x * t,
+                                                        y = (obs.y - 24f) * (1f - t) + enemy.y * t,
+                                                        vx = Random.nextFloat() * 10f - 5f,
+                                                        vy = Random.nextFloat() * 10f - 5f,
+                                                        color = obs.color,
+                                                        size = 3.5f,
+                                                        life = 10
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                "NPC_MERCHANT" -> {
+                                    if (ticks % 40 == 0) {
+                                        particles.add(
+                                            IsoParticle(
+                                                x = obs.x + Random.nextFloat() * 12f - 6f,
+                                                y = obs.y - 18f,
+                                                vx = Random.nextFloat() * 10f - 5f,
+                                                vy = -15f - Random.nextFloat() * 10f,
+                                                color = obs.color,
+                                                size = 3f,
+                                                life = 20
+                                            )
+                                        )
+                                    }
+                                }
+                                "NPC_CHEMIST" -> {
+                                    val dx = playerX - obs.x
+                                    val dy = playerY - obs.y
+                                    val dist = sqrt(dx * dx + dy * dy)
+                                    if (ticks % 30 == 0) {
+                                        particles.add(
+                                            IsoParticle(
+                                                x = obs.x + Random.nextFloat() * 16f - 8f,
+                                                y = obs.y - 10f,
+                                                vx = Random.nextFloat() * 12f - 6f,
+                                                vy = -22f,
+                                                color = obs.color,
+                                                size = 4.5f,
+                                                life = 25
+                                            )
+                                        )
+                                    }
+                                    if (dist < 45f && ticks % 80 == 0 && localPlayerHp < gameState.maxHealth) {
+                                        localPlayerHp = (localPlayerHp + 5).coerceAtMost(gameState.maxHealth)
+                                        viewModel.updatePlayerHealth(localPlayerHp)
+                                        particles.add(IsoParticle(playerX, playerY - 10f, 0f, -30f, obs.color, 5f, 1f, 15))
+                                    }
+                                }
+                                "NPC_ROGUE" -> {
+                                    val dx = playerX - obs.x
+                                    val dy = playerY - obs.y
+                                    val dist = sqrt(dx * dx + dy * dy)
+                                    if (ticks % 25 == 0) {
+                                        particles.add(
+                                            IsoParticle(
+                                                x = obs.x + Random.nextFloat() * 14f - 7f,
+                                                y = obs.y - 12f,
+                                                vx = Random.nextFloat() * 8f - 4f,
+                                                vy = -18f,
+                                                color = obs.color,
+                                                size = 3f,
+                                                life = 18
+                                            )
+                                        )
+                                    }
+                                    if (dist < 45f && ticks % 40 == 0) {
+                                        particles.add(IsoParticle(playerX, playerY, Random.nextFloat() * 10f - 5f, -5f, obs.color.copy(alpha = 0.5f), 5f, 1f, 12))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 delay(16)
             }
         }
     }
-    
-    // Slashing Trigger Action
+
+    // Dynamic Action Trigger (Melee strike or Ranged shot depending on equipped weapon)
     val performStrike: () -> Unit = {
-        if (!isAttacking) {
-            isAttacking = true
-            attackFrame = 0
-            
-            val range = 65f
-            val slashX = playerX + playerDirX * 32f
-            val slashY = playerY + playerDirY * 32f
-            
-            for (i in 0..10) {
-                particles.add(
-                    IsoParticle(
-                        x = slashX + Random.nextFloat() * 16f - 8f,
-                        y = slashY + Random.nextFloat() * 16f - 8f,
-                        vx = playerDirX * (80f + Random.nextFloat() * 40f) + Random.nextFloat() * 20f - 10f,
-                        vy = playerDirY * (80f + Random.nextFloat() * 40f) + Random.nextFloat() * 20f - 10f,
-                        color = QuantumNeonPurple,
-                        size = 8f,
-                        life = 15
-                    )
-                )
-            }
-            
-            val eIter = enemies.iterator()
-            while (eIter.hasNext()) {
-                val enemy = eIter.next()
-                val edx = enemy.x - slashX
-                val edy = enemy.y - slashY
-                val edist = sqrt(edx * edx + edy * edy)
+        val weapon = gameState.currentWeapon
+        if (weapon.type == WeaponType.MELEE) {
+            if (!isAttacking) {
+                isAttacking = true
+                attackFrame = 0
                 
-                if (edist < range) {
-                    enemy.hitCooldown = 12
-                    enemy.state = "HIT"
-                    
-                    val damage = (gameState.currentWeapon.baseAtk * (1f + gameState.level * 0.12f)).toInt() + Random.nextInt(-8, 12)
-                    enemy.hp = (enemy.hp - damage).coerceAtLeast(0)
-                    
-                    damageNumbers.add(
-                        IsoDamageNumber(
-                            id = System.nanoTime(),
-                            text = "⚔️ $damage",
-                            x = enemy.x,
-                            y = enemy.y - 12f,
-                            color = QuantumNeonOrange
+                val range = 65f
+                val slashX = playerX + playerDirX * 32f
+                val slashY = playerY + playerDirY * 32f
+                
+                for (i in 0..10) {
+                    particles.add(
+                        IsoParticle(
+                            x = slashX + Random.nextFloat() * 16f - 8f,
+                            y = slashY + Random.nextFloat() * 16f - 8f,
+                            vx = playerDirX * (80f + Random.nextFloat() * 40f) + Random.nextFloat() * 20f - 10f,
+                            vy = playerDirY * (80f + Random.nextFloat() * 40f) + Random.nextFloat() * 20f - 10f,
+                            color = QuantumNeonPurple,
+                            size = 8f,
+                            life = 15
                         )
                     )
+                }
+                
+                val eIter = enemies.iterator()
+                while (eIter.hasNext()) {
+                    val enemy = eIter.next()
+                    val edx = enemy.x - slashX
+                    val edy = enemy.y - slashY
+                    val edist = sqrt(edx * edx + edy * edy)
                     
-                    for (i in 0..5) {
-                        particles.add(
-                            IsoParticle(
-                                x = enemy.x,
-                                y = enemy.y,
-                                vx = Random.nextFloat() * 120f - 60f,
-                                vy = Random.nextFloat() * 120f - 60f,
-                                color = QuantumNeonRed,
-                                size = 5f,
-                                life = 10
-                            )
-                        )
-                    }
-                    
-                    if (enemy.hp <= 0) {
-                        for (i in 0..15) {
-                            particles.add(
-                                IsoParticle(
-                                    x = enemy.x,
-                                    y = enemy.y,
-                                    vx = Random.nextFloat() * 200f - 100f,
-                                    vy = Random.nextFloat() * 200f - 100f,
-                                    color = QuantumNeonOrange,
-                                    size = 9f,
-                                    life = 20
-                                )
-                            )
-                        }
+                    if (edist < range) {
+                        enemy.hitCooldown = 12
+                        enemy.state = "HIT"
                         
-                        collectibles.add(
-                            IsoCollectible(
-                                id = System.nanoTime(),
-                                type = "Credits",
-                                x = enemy.x,
-                                y = enemy.y,
-                                amount = Random.nextInt(120, 260),
-                                symbol = "💎"
-                            )
-                        )
-                        collectibles.add(
-                            IsoCollectible(
-                                id = System.nanoTime() + 2,
-                                type = "Nanites",
-                                x = enemy.x + 12f,
-                                y = enemy.y - 12f,
-                                amount = Random.nextInt(30, 60),
-                                symbol = "⚡"
-                            )
-                        )
-                        
-                        eIter.remove()
-                        
-                        viewModel.addResources(credits = 100, nanites = 20, xp = 150)
+                        val damage = ((gameState.currentWeapon.baseAtk + gameState.totalAtkBonus) * (1f + gameState.level * 0.12f)).toInt() + Random.nextInt(-8, 12)
+                        enemy.hp = (enemy.hp - damage).coerceAtLeast(0)
                         
                         damageNumbers.add(
                             IsoDamageNumber(
                                 id = System.nanoTime(),
-                                text = "+150 XP",
-                                x = playerX,
-                                y = playerY - 30f,
-                                color = QuantumNeonBlue
+                                text = "⚔️ $damage",
+                                x = enemy.x,
+                                y = enemy.y - 12f,
+                                color = QuantumNeonOrange
                             )
                         )
-                    }
-                }
-            }
-
-            // Check wildlife hit/harvest
-            val wIter = wildlifeList.iterator()
-            while (wIter.hasNext()) {
-                val wildlife = wIter.next()
-                val wdx = wildlife.x - slashX
-                val wdy = wildlife.y - slashY
-                val wdist = sqrt(wdx * wdx + wdy * wdy)
-                
-                if (wdist < range) {
-                    wildlife.hitCooldown = 15
-                    // Show custom harvest text for drops
-                    val dropItem = wildlife.drops.randomOrNull() ?: "Biomass"
-                    val creditReward = when (wildlife.rarity) {
-                        "Common" -> Random.nextInt(40, 85)
-                        "Rare" -> Random.nextInt(90, 160)
-                        "Epic" -> Random.nextInt(200, 350)
-                        else -> Random.nextInt(400, 800)
-                    }
-                    val xpReward = when (wildlife.rarity) {
-                        "Common" -> 50
-                        "Rare" -> 120
-                        "Epic" -> 250
-                        else -> 500
-                    }
-                    
-                    // Show particles
-                    for (i in 0..8) {
-                        particles.add(
-                            IsoParticle(
-                                x = wildlife.x,
-                                y = wildlife.y,
-                                vx = Random.nextFloat() * 140f - 70f,
-                                vy = Random.nextFloat() * 140f - 70f,
-                                color = wildlife.color,
-                                size = 6f,
-                                life = 12
-                            )
-                        )
-                    }
-                    
-                    // Add floaty reward numbers
-                    damageNumbers.add(
-                        IsoDamageNumber(
-                            id = System.nanoTime(),
-                            text = "💥 Harvest: $dropItem",
-                            x = wildlife.x,
-                            y = wildlife.y - 12f,
-                            color = QuantumNeonGreen
-                        )
-                    )
-                    
-                    damageNumbers.add(
-                        IsoDamageNumber(
-                            id = System.nanoTime() + 1,
-                            text = "+$creditReward Credits",
-                            x = wildlife.x,
-                            y = wildlife.y - 28f,
-                            color = QuantumNeonOrange
-                        )
-                    )
-                    
-                    damageNumbers.add(
-                        IsoDamageNumber(
-                            id = System.nanoTime() + 2,
-                            text = "+$xpReward XP",
-                            x = playerX,
-                            y = playerY - 30f,
-                            color = QuantumNeonBlue
-                        )
-                    )
-                    
-                    // Also drop a physical nanite or credit shard on the map!
-                    collectibles.add(
-                        IsoCollectible(
-                            id = System.nanoTime() + 3,
-                            type = dropItem,
-                            x = wildlife.x,
-                            y = wildlife.y,
-                            amount = when (wildlife.rarity) {
-                                "Common" -> Random.nextInt(1, 3)
-                                "Rare" -> Random.nextInt(3, 6)
-                                "Epic" -> Random.nextInt(5, 10)
-                                else -> Random.nextInt(10, 20)
-                            },
-                            symbol = "📦"
-                        )
-                    )
-                    
-                    viewModel.addResources(credits = creditReward, nanites = xpReward / 4, xp = xpReward)
-                    wIter.remove()
-                }
-            }
-            
-            // Check destructible obstacles (crates, etc.)
-            obstacles.forEach { obs ->
-                if (obs.isDestructible && !obs.isDestroyed) {
-                    val odx = obs.x - slashX
-                    val ody = obs.y - slashY
-                    val odist = sqrt(odx * odx + ody * ody)
-                    if (odist < range) {
-                        val damage = (gameState.currentWeapon.baseAtk * (1f + gameState.level * 0.12f)).toInt() + Random.nextInt(-5, 10)
-                        obs.hp = (obs.hp - damage).coerceAtLeast(0)
                         
-                        // Spark hit particles!
                         for (i in 0..5) {
                             particles.add(
                                 IsoParticle(
-                                    x = obs.x,
-                                    y = obs.y,
-                                    vx = Random.nextFloat() * 100f - 50f,
-                                    vy = Random.nextFloat() * 100f - 50f,
-                                    color = obs.color,
+                                    x = enemy.x,
+                                    y = enemy.y,
+                                    vx = Random.nextFloat() * 120f - 60f,
+                                    vy = Random.nextFloat() * 120f - 60f,
+                                    color = QuantumNeonRed,
                                     size = 5f,
                                     life = 10
                                 )
                             )
                         }
                         
+                        if (enemy.hp <= 0) {
+                            eIter.remove()
+                            handleEnemyDefeat(enemy)
+                        }
+                    }
+                }
+    
+                // Check wildlife hit/harvest
+                val wIter = wildlifeList.iterator()
+                while (wIter.hasNext()) {
+                    val wildlife = wIter.next()
+                    val wdx = wildlife.x - slashX
+                    val wdy = wildlife.y - slashY
+                    val wdist = sqrt(wdx * wdx + wdy * wdy)
+                    
+                    if (wdist < range) {
+                        wildlife.hitCooldown = 15
+                        val dropItem = wildlife.drops.randomOrNull() ?: "Biomass"
+                        val creditReward = when (wildlife.rarity) {
+                            "Common" -> Random.nextInt(40, 85)
+                            "Rare" -> Random.nextInt(90, 160)
+                            "Epic" -> Random.nextInt(200, 350)
+                            else -> Random.nextInt(400, 800)
+                        }
+                        val xpReward = when (wildlife.rarity) {
+                            "Common" -> 50
+                            "Rare" -> 120
+                            "Epic" -> 250
+                            else -> 500
+                        }
+                        
+                        for (i in 0..8) {
+                            particles.add(
+                                IsoParticle(
+                                    x = wildlife.x,
+                                    y = wildlife.y,
+                                    vx = Random.nextFloat() * 140f - 70f,
+                                    vy = Random.nextFloat() * 140f - 70f,
+                                    color = wildlife.color,
+                                    size = 6f,
+                                    life = 12
+                                )
+                            )
+                        }
+                        
                         damageNumbers.add(
                             IsoDamageNumber(
                                 id = System.nanoTime(),
-                                text = "💥 $damage",
-                                x = obs.x,
-                                y = obs.y - 12f,
-                                color = obs.color
+                                text = "💥 Harvest: $dropItem",
+                                x = wildlife.x,
+                                y = wildlife.y - 12f,
+                                color = QuantumNeonGreen
+                            )
+                        )
+                        damageNumbers.add(
+                            IsoDamageNumber(
+                                id = System.nanoTime() + 1,
+                                text = "+$creditReward Credits",
+                                x = wildlife.x,
+                                y = wildlife.y - 28f,
+                                color = QuantumNeonOrange
+                            )
+                        )
+                        damageNumbers.add(
+                            IsoDamageNumber(
+                                id = System.nanoTime() + 2,
+                                text = "+$xpReward XP",
+                                x = playerX,
+                                y = playerY - 30f,
+                                color = QuantumNeonBlue
                             )
                         )
                         
-                        if (obs.hp <= 0) {
-                            obs.isDestroyed = true
+                        collectibles.add(
+                            IsoCollectible(
+                                id = System.nanoTime() + 3,
+                                type = dropItem,
+                                x = wildlife.x,
+                                y = wildlife.y,
+                                amount = when (wildlife.rarity) {
+                                    "Common" -> Random.nextInt(1, 3)
+                                    "Rare" -> Random.nextInt(3, 6)
+                                    "Epic" -> Random.nextInt(5, 10)
+                                    else -> Random.nextInt(10, 20)
+                                },
+                                symbol = "📦"
+                            )
+                        )
+                        
+                        viewModel.addResources(creditReward, xpReward / 4, xpReward)
+                        wIter.remove()
+                    }
+                }
+                
+                // Check destructible obstacles
+                obstacles.forEach { obs ->
+                    if (obs.isDestructible && !obs.isDestroyed) {
+                        val odx = obs.x - slashX
+                        val ody = obs.y - slashY
+                        val odist = sqrt(odx * odx + ody * ody)
+                        if (odist < range) {
+                            val damage = ((gameState.currentWeapon.baseAtk + gameState.totalAtkBonus) * (1f + gameState.level * 0.12f)).toInt() + Random.nextInt(-5, 10)
+                            obs.hp = (obs.hp - damage).coerceAtLeast(0)
                             
-                            // Explosion particles!
-                            for (i in 0..12) {
+                            for (i in 0..5) {
                                 particles.add(
                                     IsoParticle(
                                         x = obs.x,
                                         y = obs.y,
-                                        vx = Random.nextFloat() * 160f - 80f,
-                                        vy = Random.nextFloat() * 160f - 80f,
-                                        color = QuantumNeonOrange,
-                                        size = 8f,
-                                        life = 18
+                                        vx = Random.nextFloat() * 100f - 50f,
+                                        vy = Random.nextFloat() * 100f - 50f,
+                                        color = obs.color,
+                                        size = 5f,
+                                        life = 10
                                     )
                                 )
                             }
                             
-                            // Drop collectibles!
-                            collectibles.add(
-                                IsoCollectible(
+                            damageNumbers.add(
+                                IsoDamageNumber(
                                     id = System.nanoTime(),
-                                    type = "Credits",
+                                    text = "💥 $damage",
                                     x = obs.x,
-                                    y = obs.y,
-                                    amount = Random.nextInt(80, 180),
-                                    symbol = "💎"
-                                )
-                            )
-                            collectibles.add(
-                                IsoCollectible(
-                                    id = System.nanoTime() + 1,
-                                    type = "Nanites",
-                                    x = obs.x + 10f,
-                                    y = obs.y - 10f,
-                                    amount = Random.nextInt(15, 35),
-                                    symbol = "⚡"
+                                    y = obs.y - 12f,
+                                    color = obs.color
                                 )
                             )
                             
-                            damageNumbers.add(
-                                IsoDamageNumber(
-                                    id = System.nanoTime() + 3,
-                                    text = "${obs.name} SECURED",
-                                    x = obs.x,
-                                    y = obs.y - 25f,
-                                    color = QuantumNeonGreen
-                                )
-                            )
+                            if (obs.hp <= 0) {
+                                handleCrateDestruction(obs)
+                            }
                         }
                     }
                 }
             }
+        } else {
+            // RANGED ATTACK: Shoot projectile particle in facing direction
+            val bulletColor = when (weapon.type) {
+                WeaponType.PISTOL -> QuantumNeonBlue
+                WeaponType.RIFLE -> QuantumNeonOrange
+                WeaponType.HEAVY -> QuantumNeonRed
+                WeaponType.ENERGY -> QuantumNeonGreen
+                WeaponType.QUANTUM -> QuantumNeonPurple
+                else -> Color.White
+            }
+            val bulletSize = when (weapon.type) {
+                WeaponType.PISTOL -> 7f
+                WeaponType.RIFLE -> 8f
+                WeaponType.HEAVY -> 15f
+                WeaponType.ENERGY -> 11f
+                WeaponType.QUANTUM -> 13f
+                else -> 8f
+            }
+            
+            particles.add(
+                IsoParticle(
+                    x = playerX + playerDirX * 18f,
+                    y = playerY + playerDirY * 18f,
+                    vx = playerDirX * 280f,
+                    vy = playerDirY * 280f,
+                    color = bulletColor,
+                    size = bulletSize,
+                    life = 40,
+                    isPlayerProjectile = true
+                )
+            )
+            
+            // Tiny muzzle sparks
+            for (i in 0..3) {
+                particles.add(
+                    IsoParticle(
+                        x = playerX + playerDirX * 18f,
+                        y = playerY + playerDirY * 18f,
+                        vx = playerDirX * 60f + Random.nextFloat() * 40f - 20f,
+                        vy = playerDirY * 60f + Random.nextFloat() * 40f - 20f,
+                        color = bulletColor.copy(alpha = 0.6f),
+                        size = 4f,
+                        life = 8
+                    )
+                )
+            }
+        }
+    }
+
+    // Quantum Special Ability Trigger (Consumes 20 MP to deal massive AoE damage & display dynamic fx)
+    val performQuantumSkill: () -> Unit = {
+        if (gameState.mp >= 20) {
+            viewModel.consumePlayerMp(20)
+            
+            // Emit 45 expanding neon-purple waves outwards
+            for (i in 0..45) {
+                val angle = (i / 45f) * 2 * Math.PI
+                val vx = cos(angle).toFloat() * 180f
+                val vy = sin(angle).toFloat() * 180f
+                particles.add(
+                    IsoParticle(
+                        x = playerX,
+                        y = playerY,
+                        vx = vx,
+                        vy = vy,
+                        color = QuantumNeonPurple,
+                        size = 12f,
+                        life = 35,
+                        isQuantumAbility = true
+                    )
+                )
+            }
+            
+            damageNumbers.add(
+                IsoDamageNumber(
+                    id = System.nanoTime(),
+                    text = "🌌 QUANTUM BURST! 🌌",
+                    x = playerX,
+                    y = playerY - 32f,
+                    color = QuantumNeonPurple
+                )
+            )
+            
+            // Deal massive damage to ALL enemies and destructible crates nearby!
+            val burstRange = 140f
+            val eIter = enemies.iterator()
+            while (eIter.hasNext()) {
+                val enemy = eIter.next()
+                val edx = enemy.x - playerX
+                val edy = enemy.y - playerY
+                val edist = sqrt(edx * edx + edy * edy)
+                if (edist < burstRange) {
+                    enemy.hitCooldown = 15
+                    enemy.state = "HIT"
+                    val dmg = 180 + gameState.level * 30 + Random.nextInt(-15, 25)
+                    enemy.hp = (enemy.hp - dmg).coerceAtLeast(0)
+                    
+                    damageNumbers.add(
+                        IsoDamageNumber(
+                            id = System.nanoTime() + enemy.id,
+                            text = "💥 $dmg QUANTUM",
+                            x = enemy.x,
+                            y = enemy.y - 12f,
+                            color = QuantumNeonPurple
+                        )
+                    )
+                    
+                    // Burst particles on enemy
+                    for (k in 0..6) {
+                        particles.add(
+                            IsoParticle(
+                                x = enemy.x,
+                                y = enemy.y,
+                                vx = Random.nextFloat() * 140f - 70f,
+                                vy = Random.nextFloat() * 140f - 70f,
+                                color = QuantumNeonPurple,
+                                size = 6f,
+                                life = 15
+                            )
+                        )
+                    }
+                    
+                    if (enemy.hp <= 0) {
+                        eIter.remove()
+                        handleEnemyDefeat(enemy)
+                    }
+                }
+            }
+            
+            // Also hit destructible crates
+            obstacles.forEach { obs ->
+                if (obs.isDestructible && !obs.isDestroyed) {
+                    val odx = obs.x - playerX
+                    val ody = obs.y - playerY
+                    val odist = sqrt(odx * odx + ody * ody)
+                    if (odist < burstRange) {
+                        val dmg = 180 + gameState.level * 30 + Random.nextInt(-10, 20)
+                        obs.hp = (obs.hp - dmg).coerceAtLeast(0)
+                        damageNumbers.add(IsoDamageNumber(System.nanoTime(), "💥 $dmg QUANTUM", obs.x, obs.y - 12f, QuantumNeonPurple))
+                        if (obs.hp <= 0) {
+                            handleCrateDestruction(obs)
+                        }
+                    }
+                }
+            }
+        } else {
+            // Out of MP warning!
+            damageNumbers.add(
+                IsoDamageNumber(
+                    id = System.nanoTime(),
+                    text = "NO ENERGY (NEED 20 MP)",
+                    x = playerX,
+                    y = playerY - 32f,
+                    color = QuantumNeonRed
+                )
+            )
         }
     }
     
@@ -1349,9 +2172,201 @@ fun ExploreScreen(
     // Interact / Hack Trigger Action
     val performInteract: () -> Unit = {
         activeConsoleNearby?.let { console ->
-            if (console.type.startsWith("BUILDING") || console.type == "INTERNAL_MODULE" || console.type.startsWith("PROP_")) {
+            if (console.type.startsWith("NPC_")) {
+                // Play interactive sound
+                try {
+                    val toneGen = android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 100)
+                    toneGen.startTone(android.media.ToneGenerator.TONE_CDMA_PIP, 150)
+                } catch (e: Exception) {}
+
+                // Spawn some cool digital floaty particles
+                for (i in 0..12) {
+                    val ang = Random.nextFloat() * 6.28f
+                    particles.add(
+                        IsoParticle(
+                            x = console.x,
+                            y = console.y,
+                            vx = cos(ang) * (30f + Random.nextFloat() * 20f),
+                            vy = sin(ang) * (30f + Random.nextFloat() * 20f) - 20f,
+                            color = console.color,
+                            size = 4f,
+                            life = 25
+                        )
+                    )
+                }
+
+                // Determine dialogue text
+                val msg = when (console.type) {
+                    "NPC_MERCHANT" -> "MERCHANT: 'Greetings, sector traveler. Credits streams are encrypted. Ready to trade high-tier bio-mechanical mods?'"
+                    "NPC_GUARD" -> "GUARD: 'Reputation scan complete. Aurelian Aegis barriers are stable. Standing watch against Technopunk raider infiltrations.'"
+                    "NPC_CHEMIST" -> "CHEMIST: 'Subatomic quantum crystallization rate is 98.4%. If you require nanite stabilization or bio-repair packs, step closer.'"
+                    "NPC_ROGUE" -> "OUTLAW: 'Hey kid, stay cool. Technopunks are mapping the nearby credits caches. Keep this encounter off the network.'"
+                    "NPC_COMPANION_ENG" -> "COMPANION: 'Nano-Repair Matrix online. Monitoring host life signatures at 100% capacity.'"
+                    "NPC_EXPLORER" -> "NOMAD: 'I have cataloged three void portals in this sector. The quantum effects are increasing. Be careful out there.'"
+                    else -> "OPERATIVE: 'Sector grid connection established. High-speed encrypted transmission channel is secure and active.'"
+                }
+
+                activeNpcDialogue = console
+                activeDialogueText = msg
+
+                damageNumbers.add(
+                    IsoDamageNumber(
+                        id = System.nanoTime(),
+                        text = "💬 CONNECTED",
+                        x = console.x,
+                        y = console.y - 20f,
+                        color = console.color
+                    )
+                )
+            } else if (console.type == "CONTAINER" || console.type == "CRATE" || console.type.startsWith("CRATE")) {
+                // Play interactive opening sound
+                try {
+                    val toneGen = android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 100)
+                    toneGen.startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 180)
+                } catch (e: Exception) {}
+
+                // Spawn cool fountain of gold/purple resource particles shooting up!
+                for (i in 0..25) {
+                    val ang = Random.nextFloat() * 6.28f
+                    val speedVal = 40f + Random.nextFloat() * 60f
+                    particles.add(
+                        IsoParticle(
+                            x = console.x,
+                            y = console.y,
+                            vx = cos(ang) * speedVal * 0.4f,
+                            vy = -speedVal - Random.nextFloat() * 40f,
+                            color = if (Random.nextBoolean()) QuantumNeonGreen else console.color,
+                            size = 5f + Random.nextFloat() * 3f,
+                            life = 35
+                        )
+                    )
+                }
+
+                // Award resources
+                val creditsGain = Random.nextInt(100, 250)
+                val nanitesGain = Random.nextInt(20, 50)
+                viewModel.addResources(creditsGain, nanitesGain, 150)
+
+                // Drop custom raw crafting material
+                val materials = listOf(
+                    Triple("Alloy Plate", "⚙️", "Scrap"),
+                    Triple("Nano Fiber", "🧵", "Crafting Material"),
+                    Triple("Void Crystal", "🔮", "Crafting Material"),
+                    Triple("Quantum Core", "🌀", "Crafting Material")
+                )
+                val pickedMat = materials.random()
+                val matQty = Random.nextInt(1, 3)
+                viewModel.addItemToInventory(
+                    pickedMat.first,
+                    pickedMat.third,
+                    pickedMat.second,
+                    matQty,
+                    "A raw component salvaged from sector canisters."
+                )
+
+                // Spawn on-the-ground collectibles (gold credits, purple nanites) around the opened container
+                for (k in 0..3) {
+                    val rx = console.x + (Random.nextFloat() * 30f - 15f)
+                    val ry = console.y + (Random.nextFloat() * 30f - 15f)
+                    collectibles.add(
+                        IsoCollectible(
+                            id = System.nanoTime() + k,
+                            type = if (k % 2 == 0) "Credits" else "Nanites",
+                            x = rx,
+                            y = ry,
+                            amount = if (k % 2 == 0) creditsGain / 2 else nanitesGain,
+                            symbol = if (k % 2 == 0) "💎" else "💠",
+                            isMagnetized = false
+                        )
+                    )
+                }
+
+                damageNumbers.add(
+                    IsoDamageNumber(
+                        id = System.nanoTime(),
+                        text = "📦 OPENED: +$creditsGain CR, +$nanitesGain NA",
+                        x = console.x,
+                        y = console.y - 15f,
+                        color = QuantumNeonGreen
+                    )
+                )
+
+                console.isDestroyed = true
+            } else if (console.type == "DOOR" || console.type.startsWith("DOOR")) {
+                // Play interactive door slide/unlock sound
+                try {
+                    val toneGen = android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 100)
+                    toneGen.startTone(android.media.ToneGenerator.TONE_SUP_CONFIRM, 200)
+                } catch (e: Exception) {}
+
+                // Spawn laser-dissolving horizontal particles
+                for (i in 0..20) {
+                    particles.add(
+                        IsoParticle(
+                            x = console.x + (Random.nextFloat() * 30f - 15f),
+                            y = console.y - Random.nextFloat() * 30f,
+                            vx = Random.nextFloat() * 80f - 40f,
+                            vy = Random.nextFloat() * 20f - 10f,
+                            color = console.color,
+                            size = 4f,
+                            life = 15
+                        )
+                    )
+                }
+
+                damageNumbers.add(
+                    IsoDamageNumber(
+                        id = System.nanoTime(),
+                        text = "🚪 ACCESS GRANTED",
+                        x = console.x,
+                        y = console.y - 15f,
+                        color = console.color
+                    )
+                )
+
+                console.isDestroyed = true
+            } else if (console.type == "QUANTUM_GATE") {
+                viewModel.discoverGate("gate_${selectedBiome.name.lowercase()}")
+                activeMode = 12
+                
+                try {
+                    val toneGen = android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 100)
+                    toneGen.startTone(android.media.ToneGenerator.TONE_SUP_CONFIRM, 300)
+                } catch (e: Exception) {}
+
+                for (i in 0..30) {
+                    val ang = i * (6.28f / 30f)
+                    particles.add(
+                        IsoParticle(
+                            x = console.x,
+                            y = console.y,
+                            vx = cos(ang) * 50f,
+                            vy = sin(ang) * 50f,
+                            color = console.color,
+                            size = 5f,
+                            life = 30
+                        )
+                    )
+                }
+
+                damageNumbers.add(
+                    IsoDamageNumber(
+                        id = System.nanoTime(),
+                        text = "🌀 PORTAL OPENED: WARP INTERFACE ACTIVE",
+                        x = console.x,
+                        y = console.y - 20f,
+                        color = console.color
+                    )
+                )
+            } else if (console.type.startsWith("BUILDING") || console.type == "INTERNAL_MODULE" || console.type.startsWith("PROP_")) {
                 activeInteractedStructure = console
             } else {
+                // Standard terminal hack
+                try {
+                    val toneGen = android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 100)
+                    toneGen.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 120)
+                } catch (e: Exception) {}
+
                 for (i in 0..15) {
                     val ang = Random.nextFloat() * 6.28f
                     particles.add(
@@ -1367,7 +2382,7 @@ fun ExploreScreen(
                     )
                 }
                 
-                viewModel.addResources(credits = 150, nanites = 35, xp = 200)
+                viewModel.addResources(150, 35, 200)
                 
                 damageNumbers.add(
                     IsoDamageNumber(
@@ -1670,6 +2685,75 @@ fun ExploreScreen(
                     fontFamily = FontFamily.Monospace
                 )
             }
+
+            Box(
+                modifier = Modifier
+                    .clickable { activeMode = 11 }
+                    .background(
+                        if (activeMode == 11) QuantumNeonGreen.copy(alpha = 0.15f) else Color.Transparent,
+                        RoundedCornerShape(6.dp)
+                    )
+                    .border(
+                        BorderStroke(1.dp, if (activeMode == 11) QuantumNeonGreen else Color.Transparent),
+                        RoundedCornerShape(6.dp)
+                    )
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "🧬 COLONY",
+                    color = if (activeMode == 11) QuantumNeonGreen else QuantumGrayText,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .clickable { activeMode = 12 }
+                    .background(
+                        if (activeMode == 12) QuantumNeonPurple.copy(alpha = 0.15f) else Color.Transparent,
+                        RoundedCornerShape(6.dp)
+                    )
+                    .border(
+                        BorderStroke(1.dp, if (activeMode == 12) QuantumNeonPurple else Color.Transparent),
+                        RoundedCornerShape(6.dp)
+                    )
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "🌀 WARP",
+                    color = if (activeMode == 12) QuantumNeonPurple else QuantumGrayText,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .clickable { activeMode = 13 }
+                    .background(
+                        if (activeMode == 13) QuantumNeonOrange.copy(alpha = 0.15f) else Color.Transparent,
+                        RoundedCornerShape(6.dp)
+                    )
+                    .border(
+                        BorderStroke(1.dp, if (activeMode == 13) QuantumNeonOrange else Color.Transparent),
+                        RoundedCornerShape(6.dp)
+                    )
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "🚀 STARSHIP",
+                    color = if (activeMode == 13) QuantumNeonOrange else QuantumGrayText,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
         }
         
         Spacer(modifier = Modifier.height(10.dp))
@@ -1685,15 +2769,16 @@ fun ExploreScreen(
             ) {
                 Biome.entries.forEach { b ->
                     val isSelected = selectedBiome == b
+                    val biomeColor = Color(b.color)
                     Box(
                         modifier = Modifier
                             .background(
-                                if (isSelected) b.color.copy(alpha = 0.2f) else Color.Black.copy(alpha = 0.2f),
+                                if (isSelected) biomeColor.copy(alpha = 0.2f) else Color.Black.copy(alpha = 0.2f),
                                 RoundedCornerShape(6.dp)
                             )
                             .border(
                                 1.5.dp,
-                                if (isSelected) b.color else QuantumBorder,
+                                if (isSelected) biomeColor else QuantumBorder,
                                 RoundedCornerShape(6.dp)
                             )
                             .clickable { selectedBiome = b }
@@ -1701,7 +2786,7 @@ fun ExploreScreen(
                     ) {
                         Text(
                             text = b.displayName.uppercase(),
-                            color = if (isSelected) b.color else QuantumLightText.copy(alpha = 0.7f),
+                            color = if (isSelected) biomeColor else QuantumLightText.copy(alpha = 0.7f),
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Monospace
@@ -1717,7 +2802,7 @@ fun ExploreScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .border(2.dp, selectedBiome.color, RoundedCornerShape(12.dp))
+                    .border(2.dp, Color(selectedBiome.color), RoundedCornerShape(12.dp))
                     .clip(RoundedCornerShape(12.dp))
                     .background(QuantumDarkBg)
             ) {
@@ -1846,11 +2931,11 @@ fun ExploreScreen(
                                     
                                     drawPath(
                                         path = path,
-                                        color = selectedBiome.color.copy(alpha = 0.06f)
+                                        color = Color(selectedBiome.color).copy(alpha = 0.06f)
                                     )
                                     drawPath(
                                         path = path,
-                                        color = selectedBiome.color.copy(alpha = 0.28f),
+                                        color = Color(selectedBiome.color).copy(alpha = 0.28f),
                                         style = Stroke(width = 1.dp.toPx())
                                     )
                                     
@@ -1966,6 +3051,20 @@ fun ExploreScreen(
                             name = activeCompanion.name,
                             emoji = activeCompanion.portraitSymbol,
                             color = compColor
+                        ))
+                    }
+
+                    val activePet = gameState.deployedStructures.find { it.type == "PET_ADOPTED" && it.isUpgraded }
+                    if (activePet != null) {
+                        // Position pet slightly to the side of the player
+                        val petX = playerX + playerDirY * 26f - playerDirX * 18f
+                        val petY = playerY - playerDirX * 26f - playerDirY * 18f
+                        renderList.add(IsoRenderable.CompanionRender(
+                            x = petX,
+                            y = petY,
+                            name = activePet.name + " [PET]",
+                            emoji = activePet.factionName, // emoji symbol stored in factionName
+                            color = Color(0xFF52B7FF)
                         ))
                     }
                     
@@ -2197,7 +3296,229 @@ fun ExploreScreen(
                                 }
                                 is IsoRenderable.ObstacleRender -> {
                                     val obstacle = renderable.obstacle
+                                    
+                                    // Highlight interactable objects when nearby
+                                    if (obstacle.interactable && !obstacle.isDestroyed) {
+                                        val dx = playerX - obstacle.x
+                                        val dy = playerY - obstacle.y
+                                        val dist = sqrt(dx * dx + dy * dy)
+                                        if (dist < 60f) {
+                                            val isNear = dist < 35f
+                                            val pulse = sin(ticks * (if (isNear) 0.25f else 0.1f)).toFloat() * 0.3f + 0.7f
+                                            val ringColor = obstacle.color.copy(alpha = if (isNear) pulse else 0.25f)
+                                            
+                                            // Isometric selection ellipse
+                                            drawOval(
+                                                color = ringColor,
+                                                topLeft = Offset(rDrawX - 20f, rDrawY - 10f),
+                                                size = Size(40f, 20f),
+                                                style = Stroke(width = if (isNear) 2.dp.toPx() else 1.dp.toPx())
+                                            )
+                                            
+                                            // Floating interactive arrow pointer
+                                            if (isNear) {
+                                                val bounceY = rDrawY - obstacle.radius * 1.5f - 14f + sin(ticks * 0.15f).toFloat() * 2.5f
+                                                drawCircle(
+                                                    color = obstacle.color,
+                                                    radius = 3f,
+                                                    center = Offset(rDrawX, bounceY)
+                                                )
+                                            }
+                                        }
+                                    }
+                                    
                                     when (obstacle.type) {
+                                        "BUILDING_SHELTER" -> {
+                                            // Safe Shelter Dome
+                                            drawOval(
+                                                color = Color.Black.copy(alpha = 0.55f),
+                                                topLeft = Offset(rDrawX - 35f, rDrawY - 14f),
+                                                size = Size(70f, 28f)
+                                            )
+                                            // Dome shell
+                                            drawArc(
+                                                color = Color(0xFF1E2127),
+                                                startAngle = 180f,
+                                                sweepAngle = 180f,
+                                                useCenter = true,
+                                                topLeft = Offset(rDrawX - 30f, rDrawY - 45f),
+                                                size = Size(60f, 50f)
+                                            )
+                                            drawArc(
+                                                color = obstacle.color,
+                                                startAngle = 180f,
+                                                sweepAngle = 180f,
+                                                useCenter = false,
+                                                topLeft = Offset(rDrawX - 30f, rDrawY - 45f),
+                                                size = Size(60f, 50f),
+                                                style = Stroke(width = 2.dp.toPx())
+                                            )
+                                            // Geodesic grid lines
+                                            drawLine(obstacle.color.copy(alpha = 0.4f), Offset(rDrawX - 25f, rDrawY - 20f), Offset(rDrawX + 25f, rDrawY - 20f), strokeWidth = 1f)
+                                            drawLine(obstacle.color.copy(alpha = 0.4f), Offset(rDrawX - 18f, rDrawY - 35f), Offset(rDrawX + 18f, rDrawY - 35f), strokeWidth = 1f)
+                                            drawLine(obstacle.color.copy(alpha = 0.4f), Offset(rDrawX, rDrawY - 45f), Offset(rDrawX, rDrawY), strokeWidth = 1f)
+                                            
+                                            // Floating Cross Shield Symbol on center
+                                            val pulse = sin(ticks * 0.1f).toFloat() * 0.2f + 0.8f
+                                            drawCircle(obstacle.color.copy(alpha = pulse * 0.3f), radius = 6f, center = Offset(rDrawX, rDrawY - 22f))
+                                            drawLine(obstacle.color, Offset(rDrawX - 4f, rDrawY - 22f), Offset(rDrawX + 4f, rDrawY - 22f), strokeWidth = 2f)
+                                            drawLine(obstacle.color, Offset(rDrawX, rDrawY - 26f), Offset(rDrawX, rDrawY - 18f), strokeWidth = 2f)
+                                        }
+                                        "BUILDING_HARVESTER" -> {
+                                            // Heavy Nanite Harvester
+                                            drawOval(
+                                                color = Color.Black.copy(alpha = 0.6f),
+                                                topLeft = Offset(rDrawX - 30f, rDrawY - 12f),
+                                                size = Size(60f, 24f)
+                                            )
+                                            // Rig frame
+                                            val pathRig = Path().apply {
+                                                moveTo(rDrawX - 20f, rDrawY)
+                                                lineTo(rDrawX - 5f, rDrawY - 55f)
+                                                lineTo(rDrawX + 5f, rDrawY - 55f)
+                                                lineTo(rDrawX + 20f, rDrawY)
+                                                close()
+                                            }
+                                            drawPath(pathRig, Color(0xFF2C221F)) // rusty brown
+                                            drawPath(pathRig, obstacle.color, style = Stroke(width = 1.5.dp.toPx()))
+                                            
+                                            // Rotating Drill Core (bobbing vertically)
+                                            val drillY = rDrawY - 25f + sin(ticks * 0.25f).toFloat() * 6f
+                                            val pathDrill = Path().apply {
+                                                moveTo(rDrawX - 8f, drillY)
+                                                lineTo(rDrawX + 8f, drillY)
+                                                lineTo(rDrawX, drillY + 16f)
+                                                close()
+                                            }
+                                            drawPath(pathDrill, Color.Gray)
+                                            drawPath(pathDrill, obstacle.color, style = Stroke(width = 1.dp.toPx()))
+                                             
+                                            // Glowing tubes
+                                            drawLine(obstacle.color, Offset(rDrawX - 12f, rDrawY - 15f), Offset(rDrawX - 5f, rDrawY - 55f), strokeWidth = 1.5f)
+                                            drawLine(obstacle.color, Offset(rDrawX + 12f, rDrawY - 15f), Offset(rDrawX + 5f, rDrawY - 55f), strokeWidth = 1.5f)
+                                        }
+                                        "BUILDING_FABRICATOR" -> {
+                                            // Quantum Credits Fabricator
+                                            drawOval(
+                                                color = Color.Black.copy(alpha = 0.5f),
+                                                topLeft = Offset(rDrawX - 25f, rDrawY - 10f),
+                                                size = Size(50f, 20f)
+                                            )
+                                            // Sleek metal pedestal
+                                            val pathPedestal = Path().apply {
+                                                moveTo(rDrawX - 15f, rDrawY)
+                                                lineTo(rDrawX - 10f, rDrawY - 30f)
+                                                lineTo(rDrawX + 10f, rDrawY - 30f)
+                                                lineTo(rDrawX + 15f, rDrawY)
+                                                close()
+                                            }
+                                            drawPath(pathPedestal, Color(0xFF1E222B))
+                                            drawPath(pathPedestal, obstacle.color, style = Stroke(width = 1.5.dp.toPx()))
+                                             
+                                            // Floating Holographic Spinning Cube on top
+                                            val spinAng = ticks * 0.05f
+                                            val floatOffset = sin(ticks * 0.08f).toFloat() * 3f
+                                            val cubeY = rDrawY - 45f + floatOffset
+                                            val sizeVal = 8f
+                                             
+                                            val cx = cos(spinAng) * sizeVal
+                                            val cy = sin(spinAng) * sizeVal * 0.5f
+                                            val rx = -sin(spinAng) * sizeVal
+                                            val ry = cos(spinAng) * sizeVal * 0.5f
+                                             
+                                            // Draw holographic diamond wireframe
+                                            val pathCube = Path().apply {
+                                                moveTo(rDrawX + cx.toFloat(), cubeY + cy.toFloat())
+                                                lineTo(rDrawX + rx.toFloat(), cubeY - ry.toFloat())
+                                                lineTo(rDrawX - cx.toFloat(), cubeY - cy.toFloat())
+                                                lineTo(rDrawX - rx.toFloat(), cubeY + ry.toFloat())
+                                                close()
+                                            }
+                                            drawPath(pathCube, obstacle.color.copy(alpha = 0.3f))
+                                            drawPath(pathCube, obstacle.color, style = Stroke(width = 1.5.dp.toPx()))
+                                             
+                                            // Center glowing particle
+                                            drawCircle(Color.White, radius = 2.5f, center = Offset(rDrawX, cubeY))
+                                        }
+                                        "BUILDING_NURSERY" -> {
+                                            // Pet Biomechanical Nursery Kennel
+                                            drawOval(
+                                                color = Color.Black.copy(alpha = 0.5f),
+                                                topLeft = Offset(rDrawX - 32f, rDrawY - 12f),
+                                                size = Size(64f, 24f)
+                                            )
+                                            // Kennel Cabin
+                                            val pathKennel = Path().apply {
+                                                moveTo(rDrawX - 25f, rDrawY - 2f)
+                                                lineTo(rDrawX, rDrawY - 14f)
+                                                lineTo(rDrawX + 25f, rDrawY - 2f)
+                                                lineTo(rDrawX + 25f, rDrawY - 30f)
+                                                lineTo(rDrawX, rDrawY - 45f)
+                                                lineTo(rDrawX - 25f, rDrawY - 30f)
+                                                close()
+                                            }
+                                            drawPath(pathKennel, Color(0xFF242A35))
+                                            drawPath(pathKennel, obstacle.color, style = Stroke(width = 1.5.dp.toPx()))
+                                             
+                                            // Cozy entrance glowing warm light
+                                            val pathEntrance = Path().apply {
+                                                moveTo(rDrawX - 8f, rDrawY - 4f)
+                                                lineTo(rDrawX + 8f, rDrawY - 4f)
+                                                lineTo(rDrawX + 8f, rDrawY - 18f)
+                                                lineTo(rDrawX - 8f, rDrawY - 18f)
+                                                close()
+                                            }
+                                            drawPath(pathEntrance, obstacle.color.copy(alpha = 0.4f))
+                                            drawPath(pathEntrance, obstacle.color, style = Stroke(width = 1.dp.toPx()))
+                                             
+                                            // Glowing pet ears/footprint icon above door
+                                            drawCircle(obstacle.color, radius = 2.5f, center = Offset(rDrawX - 3f, rDrawY - 28f))
+                                            drawCircle(obstacle.color, radius = 2.5f, center = Offset(rDrawX + 3f, rDrawY - 28f))
+                                            drawCircle(obstacle.color, radius = 1.5f, center = Offset(rDrawX, rDrawY - 32f))
+                                        }
+                                        "BUILDING_HQ" -> {
+                                            // Colony Main Command Headquarters
+                                            drawOval(
+                                                color = Color.Black.copy(alpha = 0.65f),
+                                                topLeft = Offset(rDrawX - 45f, rDrawY - 18f),
+                                                size = Size(90f, 36f)
+                                            )
+                                            // Heavy double-tiered command block
+                                            val pathHqBase = Path().apply {
+                                                moveTo(rDrawX - 38f, rDrawY - 5f)
+                                                lineTo(rDrawX, rDrawY - 20f)
+                                                lineTo(rDrawX + 38f, rDrawY - 5f)
+                                                lineTo(rDrawX + 38f, rDrawY - 35f)
+                                                lineTo(rDrawX, rDrawY - 50f)
+                                                lineTo(rDrawX - 38f, rDrawY - 35f)
+                                                close()
+                                            }
+                                            drawPath(pathHqBase, Color(0xFF141923)) // dark metal core
+                                            drawPath(pathHqBase, obstacle.color, style = Stroke(width = 2.dp.toPx()))
+                                             
+                                             val pathHqTop = Path().apply {
+                                                 moveTo(rDrawX - 20f, rDrawY - 35f)
+                                                 lineTo(rDrawX, rDrawY - 43f)
+                                                 lineTo(rDrawX + 20f, rDrawY - 35f)
+                                                 lineTo(rDrawX + 20f, rDrawY - 70f)
+                                                 lineTo(rDrawX, rDrawY - 78f)
+                                                 lineTo(rDrawX - 20f, rDrawY - 70f)
+                                                 close()
+                                             }
+                                             drawPath(pathHqTop, Color(0xFF1F2533))
+                                             drawPath(pathHqTop, obstacle.color, style = Stroke(width = 1.5.dp.toPx()))
+                                             
+                                             // Massive communications satellite dish on top
+                                             val pulseRadar = sin(ticks * 0.12f).toFloat() * 0.5f + 0.5f
+                                             drawLine(Color.White, Offset(rDrawX, rDrawY - 78f), Offset(rDrawX, rDrawY - 95f), strokeWidth = 2.5f)
+                                             drawCircle(obstacle.color, radius = 5f + pulseRadar * 3f, center = Offset(rDrawX, rDrawY - 95f))
+                                             drawCircle(Color.White, radius = 3f, center = Offset(rDrawX, rDrawY - 95f))
+                                             
+                                             // Glowing command windows
+                                             val windowColor = obstacle.color.copy(alpha = 0.8f)
+                                             drawRect(windowColor, Offset(rDrawX - 12f, rDrawY - 55f), Size(6f, 8f))
+                                             drawRect(windowColor, Offset(rDrawX + 6f, rDrawY - 55f), Size(6f, 8f))
+                                        }
                                         "BUILDING_TOWER" -> {
                                             // Shadow at base
                                             drawOval(
@@ -2527,7 +3848,78 @@ fun ExploreScreen(
                                                 strokeWidth = 1.5.dp.toPx()
                                             )
                                         }
-                                        "CRATE" -> {
+                                        "CONTAINER" -> {
+                                             // Bottom shadow
+                                             drawOval(
+                                                 color = Color.Black.copy(alpha = 0.4f),
+                                                 topLeft = Offset(rDrawX - 16f, rDrawY - 6f),
+                                                 size = Size(32f, 12f)
+                                             )
+                                             // Chest bottom body
+                                             val pathChest = Path().apply {
+                                                 moveTo(rDrawX - 14f, rDrawY - 2f)
+                                                 lineTo(rDrawX, rDrawY - 10f)
+                                                 lineTo(rDrawX + 14f, rDrawY - 2f)
+                                                 lineTo(rDrawX + 14f, rDrawY - 18f)
+                                                 lineTo(rDrawX, rDrawY - 26f)
+                                                 lineTo(rDrawX - 14f, rDrawY - 18f)
+                                                 close()
+                                             }
+                                             drawPath(pathChest, Color(0xFF1E232E))
+                                             drawPath(pathChest, obstacle.color, style = Stroke(width = 1.5f))
+                                             
+                                             // Chest glowing status lock bar
+                                             val lockColor = if (obstacle.isDestroyed) Color.Gray else obstacle.color
+                                             drawLine(
+                                                 color = lockColor,
+                                                 start = Offset(rDrawX - 6f, rDrawY - 14f),
+                                                 end = Offset(rDrawX + 6f, rDrawY - 11f),
+                                                 strokeWidth = 2f
+                                             )
+                                             
+                                             // Lid handle or glowing energy core
+                                             if (!obstacle.isDestroyed) {
+                                                 val p = sin(ticks * 0.1f).toFloat() * 0.2f + 0.8f
+                                                 drawCircle(
+                                                     color = obstacle.color.copy(alpha = p),
+                                                     radius = 3f,
+                                                     center = Offset(rDrawX, rDrawY - 18f)
+                                                 )
+                                             }
+                                         }
+                                         "DOOR" -> {
+                                             // Base pillars
+                                             drawRect(Color(0xFF232936), Offset(rDrawX - 18f, rDrawY - 40f), Size(6f, 40f))
+                                             drawRect(obstacle.color, Offset(rDrawX - 18f, rDrawY - 40f), Size(6f, 40f), style = Stroke(width = 1f))
+                                             
+                                             drawRect(Color(0xFF232936), Offset(rDrawX + 12f, rDrawY - 40f), Size(6f, 40f))
+                                             drawRect(obstacle.color, Offset(rDrawX + 12f, rDrawY - 40f), Size(6f, 40f), style = Stroke(width = 1f))
+                                             
+                                             if (!obstacle.isDestroyed) {
+                                                 // Glowing laser barrier beams in between the pillars
+                                                 val laserAlpha = 0.3f + sin(ticks * 0.2f).toFloat() * 0.15f
+                                                 val pathLaser = Path().apply {
+                                                     moveTo(rDrawX - 12f, rDrawY - 4f)
+                                                     lineTo(rDrawX + 12f, rDrawY - 4f)
+                                                     lineTo(rDrawX + 12f, rDrawY - 36f)
+                                                     lineTo(rDrawX - 12f, rDrawY - 36f)
+                                                     close()
+                                                 }
+                                                 drawPath(pathLaser, obstacle.color.copy(alpha = laserAlpha))
+                                                 
+                                                 // Laser line sweeps
+                                                 for (k in 0..2) {
+                                                     val ly = rDrawY - 10f - k * 10f
+                                                     drawLine(
+                                                         color = obstacle.color,
+                                                         start = Offset(rDrawX - 12f, ly),
+                                                         end = Offset(rDrawX + 12f, ly),
+                                                         strokeWidth = 1.5f
+                                                     )
+                                                 }
+                                             }
+                                         }
+                                         "CRATE" -> {
                                             if (obstacle.isDestroyed) {
                                                 drawCircle(
                                                     color = Color.Black.copy(alpha = 0.3f),
@@ -2661,76 +4053,381 @@ fun ExploreScreen(
                                         }
                                         else -> {
                                             if (obstacle.type.startsWith("NPC_")) {
-                                                // Humanoid NPC shadow
-                                                drawOval(
-                                                    color = Color.Black.copy(alpha = 0.45f),
-                                                    topLeft = Offset(rDrawX - 10f, rDrawY - 4f),
-                                                    size = Size(20f, 8f)
-                                                )
-                                                // Styled body (Jacket/Robe)
-                                                val bodyPath = Path().apply {
-                                                    moveTo(rDrawX - 8f, rDrawY - 2f)
-                                                    lineTo(rDrawX + 8f, rDrawY - 2f)
-                                                    lineTo(rDrawX + 5f, rDrawY - 18f)
-                                                    lineTo(rDrawX - 5f, rDrawY - 18f)
-                                                    close()
-                                                }
-                                                drawPath(bodyPath, obstacle.color)
-                                                drawPath(bodyPath, Color.White.copy(alpha = 0.3f), style = Stroke(width = 1f))
-
-                                                // Head
-                                                drawCircle(
-                                                    color = Color(0xFFF1C27D), // Skin tone
-                                                    radius = 5f,
-                                                    center = Offset(rDrawX, rDrawY - 23f)
-                                                )
-
-                                                // Glowing eyes/visor
-                                                drawLine(
-                                                    color = if (obstacle.color == QuantumNeonRed) QuantumNeonBlue else QuantumNeonGreen,
-                                                    start = Offset(rDrawX - 3f, rDrawY - 24f),
-                                                    end = Offset(rDrawX + 3f, rDrawY - 24f),
-                                                    strokeWidth = 1.5f
-                                                )
-
                                                 // Dynamic breathing hover effect
                                                 val floatY = sin((ticks * 0.08f + obstacle.id)).toFloat() * 2f
+                                                val bounceY = sin(ticks * 0.12f).toFloat() * 1.5f
                                                 
-                                                // Draw small accessory circle above head
-                                                drawCircle(
-                                                    color = obstacle.color.copy(alpha = 0.25f),
-                                                    radius = 7f,
-                                                    center = Offset(rDrawX, rDrawY - 36f + floatY)
-                                                )
-                                                drawCircle(
-                                                    color = obstacle.color,
-                                                    radius = 2f,
-                                                    center = Offset(rDrawX, rDrawY - 36f + floatY)
-                                                )
-                                            } else if (obstacle.type.startsWith("PROP_")) {
-                                                // Fallback for props - nice neon-tech crate/generator
-                                                drawOval(
-                                                    color = Color.Black.copy(alpha = 0.4f),
-                                                    topLeft = Offset(rDrawX - 16f, rDrawY - 6f),
-                                                    size = Size(32f, 12f)
-                                                )
-                                                val propPath = Path().apply {
-                                                    moveTo(rDrawX - 12f, rDrawY - 2f)
-                                                    lineTo(rDrawX + 12f, rDrawY - 2f)
-                                                    lineTo(rDrawX + 12f, rDrawY - 24f)
-                                                    lineTo(rDrawX - 12f, rDrawY - 24f)
-                                                    close()
+                                                when (obstacle.type) {
+                                                    "NPC_COMPANION_ENG" -> {
+                                                        // Hovering Engineering Drone bot
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.35f),
+                                                            topLeft = Offset(rDrawX - 12f, rDrawY - 4f),
+                                                            size = Size(24f, 8f)
+                                                        )
+                                                        // Main Sphere Body (pulsing hover)
+                                                        val cy = rDrawY - 18f + floatY
+                                                        drawCircle(Color(0xFF222C3A), radius = 10f, center = Offset(rDrawX, cy))
+                                                        drawCircle(obstacle.color, radius = 10f, center = Offset(rDrawX, cy), style = Stroke(width = 1.5f))
+                                                        
+                                                        // Glowing reactor eye
+                                                        val eyePulse = 0.4f + sin(ticks * 0.15f).toFloat() * 0.3f
+                                                        drawCircle(obstacle.color.copy(alpha = eyePulse + 0.3f), radius = 4f, center = Offset(rDrawX, cy - 1f))
+                                                        drawCircle(Color.White, radius = 1.5f, center = Offset(rDrawX, cy - 1f))
+                                                        
+                                                        // Hovering side fans / panels
+                                                        drawLine(Color.Gray, Offset(rDrawX - 10f, cy), Offset(rDrawX - 15f, cy + 2f), strokeWidth = 2f)
+                                                        drawLine(Color.Gray, Offset(rDrawX + 10f, cy), Offset(rDrawX + 15f, cy + 2f), strokeWidth = 2f)
+                                                        drawCircle(obstacle.color, radius = 3f, center = Offset(rDrawX - 15f, cy + 2f))
+                                                        drawCircle(obstacle.color, radius = 3f, center = Offset(rDrawX + 15f, cy + 2f))
+                                                    }
+                                                    "NPC_MERCHANT" -> {
+                                                        // Hologram Merchant Kiosk
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.5f),
+                                                            topLeft = Offset(rDrawX - 18f, rDrawY - 6f),
+                                                            size = Size(36f, 12f)
+                                                        )
+                                                        // Platform base
+                                                        drawRect(Color(0xFF1E222A), Offset(rDrawX - 14f, rDrawY - 6f), Size(28f, 6f))
+                                                        drawRect(obstacle.color, Offset(rDrawX - 14f, rDrawY - 6f), Size(28f, 6f), style = Stroke(width = 1f))
+                                                        
+                                                        // Projection beam
+                                                        val beamAlpha = 0.15f + sin(ticks * 0.1f).toFloat() * 0.05f
+                                                        val pathBeam = Path().apply {
+                                                            moveTo(rDrawX - 8f, rDrawY - 6f)
+                                                            lineTo(rDrawX + 8f, rDrawY - 6f)
+                                                            lineTo(rDrawX + 14f, rDrawY - 32f)
+                                                            lineTo(rDrawX - 14f, rDrawY - 32f)
+                                                            close()
+                                                        }
+                                                        drawPath(pathBeam, obstacle.color.copy(alpha = beamAlpha))
+                                                        
+                                                        // Floating Shop Hologram Symbol ("$" / "🛒")
+                                                        val holoy = rDrawY - 24f + floatY
+                                                        drawCircle(obstacle.color.copy(alpha = 0.2f), radius = 12f, center = Offset(rDrawX, holoy))
+                                                        drawCircle(obstacle.color, radius = 12f, center = Offset(rDrawX, holoy), style = Stroke(width = 1f))
+                                                        // Draw inner neon cross or merchant icon lines
+                                                        drawLine(obstacle.color, Offset(rDrawX - 6f, holoy), Offset(rDrawX + 6f, holoy), strokeWidth = 2f)
+                                                        drawLine(obstacle.color, Offset(rDrawX, holoy - 6f), Offset(rDrawX, holoy + 6f), strokeWidth = 2f)
+                                                    }
+                                                    "NPC_GUARD" -> {
+                                                        // Heavy Defensive Guard
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.5f),
+                                                            topLeft = Offset(rDrawX - 12f, rDrawY - 4f),
+                                                            size = Size(24f, 8f)
+                                                        )
+                                                        // Heavy power armor body
+                                                        val pathArmor = Path().apply {
+                                                            moveTo(rDrawX - 10f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 10f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 8f, rDrawY - 22f)
+                                                            lineTo(rDrawX - 8f, rDrawY - 22f)
+                                                            close()
+                                                        }
+                                                        drawPath(pathArmor, Color(0xFF2E3138))
+                                                        drawPath(pathArmor, obstacle.color, style = Stroke(width = 1.5f))
+                                                        
+                                                        // Cyber Helmet
+                                                        drawCircle(Color(0xFF1B1D22), radius = 5.5f, center = Offset(rDrawX, rDrawY - 27.5f))
+                                                        drawCircle(obstacle.color, radius = 5.5f, center = Offset(rDrawX, rDrawY - 27.5f), style = Stroke(width = 1f))
+                                                        // Glowing visor
+                                                        drawLine(obstacle.color, Offset(rDrawX - 3f, rDrawY - 28f), Offset(rDrawX + 3f, rDrawY - 28f), strokeWidth = 2f)
+                                                        
+                                                        // Shoulder heavy cannon
+                                                        drawLine(Color.Gray, Offset(rDrawX - 6f, rDrawY - 18f), Offset(rDrawX - 14f, rDrawY - 24f), strokeWidth = 3f)
+                                                        drawCircle(obstacle.color, radius = 2.5f, center = Offset(rDrawX - 14f, rDrawY - 24f))
+                                                    }
+                                                    "NPC_CHEMIST" -> {
+                                                        // Lab Chemistry Synthesis Station
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.45f),
+                                                            topLeft = Offset(rDrawX - 15f, rDrawY - 5f),
+                                                            size = Size(30f, 10f)
+                                                        )
+                                                        // Table base
+                                                        drawRect(Color(0xFF2B303C), Offset(rDrawX - 14f, rDrawY - 6f), Size(28f, 10f))
+                                                        drawRect(obstacle.color, Offset(rDrawX - 14f, rDrawY - 6f), Size(28f, 10f), style = Stroke(width = 1.5f))
+                                                        
+                                                        // Bubbling flasks
+                                                        val bubbleY = rDrawY - 14f + bounceY
+                                                        drawLine(Color.LightGray, Offset(rDrawX - 6f, rDrawY - 6f), Offset(rDrawX - 6f, bubbleY), strokeWidth = 2f)
+                                                        drawCircle(obstacle.color, radius = 4f, center = Offset(rDrawX - 6f, bubbleY))
+                                                        
+                                                        drawLine(Color.LightGray, Offset(rDrawX + 6f, rDrawY - 6f), Offset(rDrawX + 6f, bubbleY - 2f), strokeWidth = 2f)
+                                                        drawCircle(obstacle.color.copy(alpha = 0.7f), radius = 3.5f, center = Offset(rDrawX + 6f, bubbleY - 2f))
+                                                    }
+                                                    "NPC_ROGUE" -> {
+                                                        // Rogue stealth dealer (cloaked, translucent)
+                                                        val rogueAlpha = 0.35f + sin(ticks * 0.08f).toFloat() * 0.15f
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.25f),
+                                                            topLeft = Offset(rDrawX - 10f, rDrawY - 4f),
+                                                            size = Size(20f, 8f)
+                                                        )
+                                                        // Hooded cloak body
+                                                        val pathCloak = Path().apply {
+                                                            moveTo(rDrawX - 8f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 8f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 4f, rDrawY - 20f)
+                                                            lineTo(rDrawX - 4f, rDrawY - 20f)
+                                                            close()
+                                                        }
+                                                        drawPath(pathCloak, obstacle.color.copy(alpha = rogueAlpha))
+                                                        drawPath(pathCloak, Color.White.copy(alpha = 0.2f), style = Stroke(width = 1f))
+                                                        
+                                                        // Glowing hidden eyes in the dark hood
+                                                        drawCircle(Color.Black, radius = 4f, center = Offset(rDrawX, rDrawY - 24f))
+                                                        drawLine(obstacle.color, Offset(rDrawX - 2.5f, rDrawY - 24f), Offset(rDrawX + 2.5f, rDrawY - 24f), strokeWidth = 1.5f)
+                                                    }
+                                                    "NPC_EXPLORER" -> {
+                                                        // Explorer tracking specialist
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.45f),
+                                                            topLeft = Offset(rDrawX - 10f, rDrawY - 4f),
+                                                            size = Size(20f, 8f)
+                                                        )
+                                                        // Explorer body
+                                                        val pathExpl = Path().apply {
+                                                            moveTo(rDrawX - 7f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 7f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 4f, rDrawY - 18f)
+                                                            lineTo(rDrawX - 4f, rDrawY - 18f)
+                                                            close()
+                                                        }
+                                                        drawPath(pathExpl, Color(0xFF2C3539))
+                                                        drawPath(pathExpl, obstacle.color, style = Stroke(width = 1.2f))
+                                                        
+                                                        // Glowing mapping visor
+                                                        drawCircle(Color(0xFFE5A65D), radius = 4.5f, center = Offset(rDrawX, rDrawY - 22.5f))
+                                                        drawLine(obstacle.color, Offset(rDrawX - 2.5f, rDrawY - 23f), Offset(rDrawX + 2.5f, rDrawY - 23f), strokeWidth = 1.5f)
+                                                        
+                                                        // Scanning beam circle
+                                                        val scanPulse = sin(ticks * 0.08f).toFloat() * 0.5f + 0.5f
+                                                        drawCircle(obstacle.color.copy(alpha = scanPulse * 0.25f), radius = 15f + scanPulse * 15f, center = Offset(rDrawX, rDrawY))
+                                                    }
+                                                    else -> {
+                                                        // Standard fallback NPC
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.45f),
+                                                            topLeft = Offset(rDrawX - 10f, rDrawY - 4f),
+                                                            size = Size(20f, 8f)
+                                                        )
+                                                        val bodyPath = Path().apply {
+                                                            moveTo(rDrawX - 8f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 8f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 5f, rDrawY - 18f)
+                                                            lineTo(rDrawX - 5f, rDrawY - 18f)
+                                                            close()
+                                                        }
+                                                        drawPath(bodyPath, obstacle.color)
+                                                        drawCircle(Color(0xFFF1C27D), radius = 5f, center = Offset(rDrawX, rDrawY - 23f))
+                                                        drawLine(Color.White, Offset(rDrawX - 3f, rDrawY - 24f), Offset(rDrawX + 3f, rDrawY - 24f), strokeWidth = 1.5f)
+                                                    }
                                                 }
-                                                drawPath(propPath, Color(0xFF1E222A))
-                                                drawPath(propPath, obstacle.color, style = Stroke(width = 1.5.dp.toPx()))
-                                                // Glowing neon indicator line
-                                                val glowVal = 0.3f + sin(ticks * 0.1f).toFloat() * 0.2f
-                                                drawLine(
-                                                    color = obstacle.color.copy(alpha = glowVal + 0.5f),
-                                                    start = Offset(rDrawX - 8f, rDrawY - 12f),
-                                                    end = Offset(rDrawX + 8f, rDrawY - 12f),
-                                                    strokeWidth = 2.dp.toPx()
-                                                )
+                                            } else if (obstacle.type.startsWith("PROP_")) {
+                                                // Dynamic pulsing value
+                                                val pulse = sin(ticks * 0.12f).toFloat() * 0.5f + 0.5f
+                                                val bounceY = sin(ticks * 0.08f).toFloat() * 3f
+                                                
+                                                when (obstacle.type) {
+                                                    "PROP_COOLING_CORE" -> {
+                                                        // Neon Cooling Core
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.45f),
+                                                            topLeft = Offset(rDrawX - 16f, rDrawY - 6f),
+                                                            size = Size(32f, 12f)
+                                                        )
+                                                        // Metal base
+                                                        drawRect(Color(0xFF1E222B), Offset(rDrawX - 12f, rDrawY - 6f), Size(24f, 8f))
+                                                        drawRect(obstacle.color, Offset(rDrawX - 12f, rDrawY - 6f), Size(24f, 8f), style = Stroke(width = 1.5f))
+                                                        
+                                                        // Neon Coolant Cylinder
+                                                        drawRoundRect(
+                                                            color = Color(0xFF10141D),
+                                                            topLeft = Offset(rDrawX - 8f, rDrawY - 30f),
+                                                            size = Size(16f, 24f),
+                                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f)
+                                                        )
+                                                        // Glowing coolant fluid
+                                                        val fluidHeight = 12f + pulse * 10f
+                                                        drawRoundRect(
+                                                            color = obstacle.color.copy(alpha = 0.6f),
+                                                            topLeft = Offset(rDrawX - 6f, rDrawY - 6f - fluidHeight),
+                                                            size = Size(12f, fluidHeight),
+                                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(2f, 2f)
+                                                        )
+                                                        drawRoundRect(
+                                                            color = obstacle.color,
+                                                            topLeft = Offset(rDrawX - 8f, rDrawY - 30f),
+                                                            size = Size(16f, 24f),
+                                                            style = Stroke(width = 1.5f),
+                                                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f)
+                                                        )
+                                                        
+                                                        // Condenser core rings
+                                                        drawLine(obstacle.color, Offset(rDrawX - 8f, rDrawY - 14f), Offset(rDrawX + 8f, rDrawY - 14f), strokeWidth = 2f)
+                                                        drawLine(obstacle.color, Offset(rDrawX - 8f, rDrawY - 22f), Offset(rDrawX + 8f, rDrawY - 22f), strokeWidth = 2f)
+                                                    }
+                                                    "PROP_CARGO_VAULT" -> {
+                                                        // Secure Cargo Vault
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.5f),
+                                                            topLeft = Offset(rDrawX - 18f, rDrawY - 6f),
+                                                            size = Size(36f, 12f)
+                                                        )
+                                                        // Armored steel chest box
+                                                        val pathChest = Path().apply {
+                                                            moveTo(rDrawX - 15f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 15f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 15f, rDrawY - 22f)
+                                                            lineTo(rDrawX - 15f, rDrawY - 22f)
+                                                            close()
+                                                        }
+                                                        drawPath(pathChest, Color(0xFF2B323D))
+                                                        drawPath(pathChest, obstacle.color, style = Stroke(width = 1.5f))
+                                                        
+                                                        // Gold locks / bands
+                                                        drawRect(obstacle.color.copy(alpha = 0.8f), Offset(rDrawX - 10f, rDrawY - 22f), Size(3f, 20f))
+                                                        drawRect(obstacle.color.copy(alpha = 0.8f), Offset(rDrawX + 7f, rDrawY - 22f), Size(3f, 20f))
+                                                        
+                                                        // Electronic keypad glow
+                                                        drawCircle(
+                                                            color = if (ticks % 30 < 15) obstacle.color else Color.Red,
+                                                            radius = 2.5f,
+                                                            center = Offset(rDrawX, rDrawY - 14f)
+                                                        )
+                                                    }
+                                                    "PROP_TELEMETRY_DISH" -> {
+                                                        // Satellite Telemetry Dish
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.45f),
+                                                            topLeft = Offset(rDrawX - 16f, rDrawY - 6f),
+                                                            size = Size(32f, 12f)
+                                                        )
+                                                        // Stand / Pivot
+                                                        drawLine(Color.Gray, Offset(rDrawX, rDrawY), Offset(rDrawX, rDrawY - 14f), strokeWidth = 3f)
+                                                        
+                                                        // Rotating dish sweep
+                                                        val sweepAng = ticks * 0.05f
+                                                        val rx = cos(sweepAng) * 12f
+                                                        val ry = sin(sweepAng) * 4f
+                                                        
+                                                        // Draw dish arc
+                                                        drawLine(obstacle.color, Offset(rDrawX - rx, rDrawY - 14f - ry), Offset(rDrawX + rx, rDrawY - 14f + ry), strokeWidth = 2.5f)
+                                                        drawLine(Color.White, Offset(rDrawX, rDrawY - 14f), Offset(rDrawX + rx*0.5f, rDrawY - 22f + ry*0.5f), strokeWidth = 1.5f)
+                                                        drawCircle(obstacle.color, radius = 3f, center = Offset(rDrawX + rx*0.5f, rDrawY - 22f + ry*0.5f))
+                                                    }
+                                                    "PROP_WAYFINDER" -> {
+                                                        // Holographic Wayfinder
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.4f),
+                                                            topLeft = Offset(rDrawX - 14f, rDrawY - 5f),
+                                                            size = Size(28f, 10f)
+                                                        )
+                                                        // Sleek post
+                                                        drawLine(Color.DarkGray, Offset(rDrawX, rDrawY), Offset(rDrawX, rDrawY - 24f), strokeWidth = 2f)
+                                                        drawCircle(obstacle.color, radius = 3f, center = Offset(rDrawX, rDrawY - 24f))
+                                                        
+                                                        // Floating arrow hologram
+                                                        val arrowY = rDrawY - 38f + bounceY
+                                                        val pathArrow = Path().apply {
+                                                            moveTo(rDrawX, arrowY - 6f)
+                                                            lineTo(rDrawX - 5f, arrowY)
+                                                            lineTo(rDrawX - 2f, arrowY)
+                                                            lineTo(rDrawX - 2f, arrowY + 6f)
+                                                            lineTo(rDrawX + 2f, arrowY + 6f)
+                                                            lineTo(rDrawX + 2f, arrowY)
+                                                            lineTo(rDrawX + 5f, arrowY)
+                                                            close()
+                                                        }
+                                                        drawPath(pathArrow, obstacle.color.copy(alpha = 0.3f + pulse * 0.4f))
+                                                        drawPath(pathArrow, obstacle.color, style = Stroke(width = 1f))
+                                                    }
+                                                    "PROP_VOID_OBELISK" -> {
+                                                        // Void Gravity Obelisk
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.55f),
+                                                            topLeft = Offset(rDrawX - 15f, rDrawY - 6f),
+                                                            size = Size(30f, 12f)
+                                                        )
+                                                        // Ancient Carved Obelisk Pillar
+                                                        val pathObelisk = Path().apply {
+                                                            moveTo(rDrawX, rDrawY + 2f)
+                                                            lineTo(rDrawX - 8f, rDrawY - 10f)
+                                                            lineTo(rDrawX - 4f, rDrawY - 42f)
+                                                            lineTo(rDrawX + 4f, rDrawY - 42f)
+                                                            lineTo(rDrawX + 8f, rDrawY - 10f)
+                                                            close()
+                                                        }
+                                                        drawPath(pathObelisk, Color(0xFF140D1F))
+                                                        drawPath(pathObelisk, obstacle.color, style = Stroke(width = 1.5f))
+                                                        
+                                                        // Floating power fragment on top
+                                                        val fragY = rDrawY - 54f + bounceY
+                                                        val pathFrag = Path().apply {
+                                                            moveTo(rDrawX, fragY - 6f)
+                                                            lineTo(rDrawX - 4f, fragY)
+                                                            lineTo(rDrawX, fragY + 6f)
+                                                            lineTo(rDrawX + 4f, fragY)
+                                                            close()
+                                                        }
+                                                        drawPath(pathFrag, obstacle.color.copy(alpha = 0.3f + pulse * 0.4f))
+                                                        drawPath(pathFrag, Color.White, style = Stroke(width = 1f))
+                                                        
+                                                        // Neon engraved runes glow
+                                                        drawLine(obstacle.color.copy(alpha = pulse), Offset(rDrawX - 3f, rDrawY - 18f), Offset(rDrawX + 3f, rDrawY - 18f), strokeWidth = 2f)
+                                                        drawLine(obstacle.color.copy(alpha = 1f - pulse), Offset(rDrawX - 2f, rDrawY - 28f), Offset(rDrawX + 2f, rDrawY - 28f), strokeWidth = 2f)
+                                                    }
+                                                    "PROP_VOLATILE_DRUM" -> {
+                                                        // Volatile Drum
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.45f),
+                                                            topLeft = Offset(rDrawX - 14f, rDrawY - 5f),
+                                                            size = Size(28f, 10f)
+                                                        )
+                                                        // Unstable metal barrel
+                                                        val pathBarrel = Path().apply {
+                                                            moveTo(rDrawX - 11f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 11f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 11f, rDrawY - 26f)
+                                                            lineTo(rDrawX - 11f, rDrawY - 26f)
+                                                            close()
+                                                        }
+                                                        drawPath(pathBarrel, Color(0xFF332321))
+                                                        drawPath(pathBarrel, obstacle.color, style = Stroke(width = 1.5f))
+                                                        
+                                                        // Warning glowing hazard stripe
+                                                        val stripeAlpha = 0.4f + pulse * 0.4f
+                                                        drawRect(obstacle.color.copy(alpha = stripeAlpha), Offset(rDrawX - 11f, rDrawY - 16f), Size(22f, 6f))
+                                                        // Middle band ring
+                                                        drawLine(Color.DarkGray, Offset(rDrawX - 11f, rDrawY - 14f), Offset(rDrawX + 11f, rDrawY - 14f), strokeWidth = 2.5f)
+                                                    }
+                                                    else -> {
+                                                        // Fallback prop
+                                                        drawOval(
+                                                            color = Color.Black.copy(alpha = 0.4f),
+                                                            topLeft = Offset(rDrawX - 16f, rDrawY - 6f),
+                                                            size = Size(32f, 12f)
+                                                        )
+                                                        val propPath = Path().apply {
+                                                            moveTo(rDrawX - 12f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 12f, rDrawY - 2f)
+                                                            lineTo(rDrawX + 12f, rDrawY - 24f)
+                                                            lineTo(rDrawX - 12f, rDrawY - 24f)
+                                                            close()
+                                                        }
+                                                        drawPath(propPath, Color(0xFF1E222A))
+                                                        drawPath(propPath, obstacle.color, style = Stroke(width = 1.5.dp.toPx()))
+                                                        drawLine(
+                                                            color = obstacle.color.copy(alpha = 0.8f),
+                                                            start = Offset(rDrawX - 8f, rDrawY - 12f),
+                                                            end = Offset(rDrawX + 8f, rDrawY - 12f),
+                                                            strokeWidth = 2.dp.toPx()
+                                                        )
+                                                    }
+                                                }
                                             } else {
                                                 // Default fallback drawing (a clean neon pyramid/crystal)
                                                 val defaultPath = Path().apply {
@@ -2857,7 +4554,7 @@ fun ExploreScreen(
                 ) {
                     Text(
                         text = "🛰️ ${selectedBiome.displayName.uppercase()}",
-                        color = selectedBiome.color,
+                        color = Color(selectedBiome.color),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace
@@ -2911,6 +4608,12 @@ fun ExploreScreen(
                             ) {
                                 val actionLabel = if (console.type.startsWith("BUILDING") || console.type == "INTERNAL_MODULE") {
                                     "🛰️ ENTER ${console.name.uppercase()}"
+                                } else if (console.type.startsWith("NPC_")) {
+                                    "💬 TALK TO ${console.name.uppercase()}"
+                                } else if (console.type == "CONTAINER" || console.type == "CRATE") {
+                                    "📦 OPEN ${console.name.uppercase()}"
+                                } else if (console.type == "DOOR") {
+                                    "🚪 OPEN ${console.name.uppercase()}"
                                 } else {
                                     "⚡ HACK ${console.name.uppercase()}"
                                 }
@@ -2970,6 +4673,28 @@ fun ExploreScreen(
                         ) {
                             Text("🌀", fontSize = 16.sp)
                         }
+                        
+                        // Quantum Skill trigger
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .background(
+                                    if (gameState.mp >= 20) QuantumNeonPurple.copy(alpha = 0.2f) else Color.Black.copy(alpha = 0.4f),
+                                    CircleShape
+                                )
+                                .border(
+                                    2.dp,
+                                    if (gameState.mp >= 20) QuantumNeonPurple else Color.Gray.copy(alpha = 0.5f),
+                                    CircleShape
+                                )
+                                .clickable { performQuantumSkill() },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("🌌", fontSize = 14.sp)
+                                Text("20MP", fontSize = 7.sp, color = if (gameState.mp >= 20) Color.White else Color.Gray, fontWeight = FontWeight.Bold)
+                            }
+                        }
                     }
                     
                     // Strike attack button
@@ -3003,7 +4728,7 @@ fun ExploreScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 items(gameState.mapState) { poi ->
-                    val biomeColor = poi.biome.color
+                    val biomeColor = Color(poi.biome.color)
                     CyberCard(borderColor = if (poi.isCleared) QuantumBorder else biomeColor) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -3160,11 +4885,155 @@ fun ExploreScreen(
                 viewModel = viewModel,
                 gameState = gameState
             )
-        } else {
+        } else if (activeMode == 10) {
             VfxLibraryView(
                 viewModel = viewModel,
                 gameState = gameState
             )
+        } else if (activeMode == 11) {
+            ColonyHubView(
+                viewModel = viewModel,
+                gameState = gameState,
+                selectedBiome = selectedBiome,
+                playerX = playerX,
+                playerY = playerY,
+                obstacles = obstacles,
+                ticks = ticks,
+                particles = particles,
+                damageNumbers = damageNumbers
+            )
+        } else if (activeMode == 12) {
+            QuantumWarpView(
+                viewModel = viewModel,
+                gameState = gameState
+            )
+        } else {
+            StarshipCommandView(
+                viewModel = viewModel,
+                gameState = gameState
+            )
+        }
+    }
+
+    activeNpcDialogue?.let { npc ->
+        androidx.compose.ui.window.Dialog(onDismissRequest = { activeNpcDialogue = null }) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth(0.95f)
+                    .wrapContentHeight()
+                    .border(2.dp, npc.color, RoundedCornerShape(12.dp)),
+                colors = CardDefaults.cardColors(containerColor = QuantumDarkBg)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .padding(16.dp)
+                        .fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "📡 QUANTUM TRANSMISSION ENCRYPTED",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = npc.color
+                        )
+                        Text(
+                            text = "[CLOSE]",
+                            color = Color.Gray,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .clickable { activeNpcDialogue = null }
+                                .padding(4.dp)
+                        )
+                    }
+                    
+                    HorizontalDivider(color = QuantumBorder, modifier = Modifier.padding(vertical = 8.dp))
+                    
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .background(npc.color.copy(alpha = 0.15f), RoundedCornerShape(8.dp))
+                                .border(1.5.dp, npc.color, RoundedCornerShape(8.dp)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = when (npc.type) {
+                                    "NPC_MERCHANT" -> "🛒"
+                                    "NPC_GUARD" -> "🛡️"
+                                    "NPC_CHEMIST" -> "🧪"
+                                    "NPC_ROGUE" -> "👤"
+                                    "NPC_COMPANION_ENG" -> "🤖"
+                                    "NPC_EXPLORER" -> "🧭"
+                                    else -> "🛸"
+                                },
+                                fontSize = 24.sp
+                            )
+                        }
+                        
+                        Column {
+                            Text(
+                                text = npc.name.uppercase(),
+                                fontSize = 14.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = npc.color
+                            )
+                            Text(
+                                text = "SECTOR OPERATIVE // TYPE: ${npc.type.substringAfter("NPC_")}",
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = QuantumGrayText
+                            )
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(12.dp))
+                    
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                            .border(1.dp, QuantumBorder, RoundedCornerShape(8.dp))
+                            .padding(12.dp)
+                    ) {
+                        Text(
+                            text = activeDialogueText,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = Color.White,
+                            lineHeight = 16.sp
+                        )
+                    }
+                    
+                    Spacer(modifier = Modifier.height(16.dp))
+                    
+                    Button(
+                        onClick = { activeNpcDialogue = null },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = npc.color),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            text = "ACKNOWLEDGE SECURITY LOG",
+                            color = Color.Black,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -3215,7 +5084,7 @@ fun ExploreScreen(
                         )
                     }
                     
-                    Divider(color = QuantumBorder, modifier = Modifier.padding(vertical = 8.dp))
+                    HorizontalDivider(color = QuantumBorder, modifier = Modifier.padding(vertical = 8.dp))
                     
                     Text(
                         text = "STRUCTURE: ${structure.name.uppercase()}",
@@ -3280,7 +5149,7 @@ fun ExploreScreen(
                         CyberButton(
                             onClick = {
                                 if (structure.name.contains("Medical")) {
-                                    viewModel.addResources(credits = 0, nanites = 0, xp = 50)
+                                    viewModel.addResources(0, 0, 50)
                                     viewModel.healPlayerToFull()
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "HEALTH RESTORED!", playerX, playerY - 40f, QuantumNeonGreen))
                                 } else if (structure.name.contains("Power")) {
@@ -3288,27 +5157,27 @@ fun ExploreScreen(
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "+40 MP CHARGED!", playerX, playerY - 40f, QuantumNeonBlue))
                                 } else if (structure.name.contains("Cooling")) {
                                     viewModel.restorePlayerMp(30)
-                                    viewModel.addResources(credits = 0, nanites = 0, xp = 50)
+                                    viewModel.addResources(0, 0, 50)
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "+30 MP COOLANT LOADED!", playerX, playerY - 40f, QuantumNeonBlue))
                                 } else if (structure.name.contains("Vault")) {
-                                    viewModel.addResources(credits = 120, nanites = 20, xp = 40)
+                                    viewModel.addResources(120, 20, 40)
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "VAULT HARVESTED: +120 CRD!", playerX, playerY - 40f, QuantumNeonGreen))
                                 } else if (structure.name.contains("Dish")) {
-                                    viewModel.addResources(credits = 25, nanites = 0, xp = 80)
+                                    viewModel.addResources(25, 0, 80)
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "SATELLITE SYNCED: +80 XP!", playerX, playerY - 40f, QuantumNeonGreen))
                                 } else if (structure.name.contains("Wayfinder")) {
-                                    viewModel.addResources(credits = 40, nanites = 5, xp = 30)
+                                    viewModel.addResources(40, 5, 30)
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "HOLOGRAM PULSED!", playerX, playerY - 40f, QuantumNeonPurple))
                                 } else if (structure.name.contains("obelisk")) {
-                                    viewModel.addResources(credits = 0, nanites = 10, xp = 60)
+                                    viewModel.addResources(0, 10, 60)
                                     viewModel.healPlayerToFull()
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "RESONANCE CHANNELED!", playerX, playerY - 40f, QuantumNeonPurple))
                                 } else if (structure.name.contains("Drum")) {
-                                    viewModel.addResources(credits = 0, nanites = 0, xp = 100)
+                                    viewModel.addResources(0, 0, 100)
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "BOOM! DRUM DETONATED!", playerX, playerY - 40f, QuantumNeonRed))
                                     obstacles.removeAll { it.id == structure.id }
                                 } else {
-                                    viewModel.addResources(credits = harvestCredits, nanites = harvestNanites, xp = 75)
+                                    viewModel.addResources(harvestCredits, harvestNanites, 75)
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "+$harvestCredits CREDITS / +$harvestNanites NANITES!", playerX, playerY - 40f, QuantumNeonGreen))
                                 }
                                 activeInteractedStructure = null
@@ -3375,11 +5244,236 @@ fun ExploreScreen(
 // --- SCREEN 2: AUGMENTATION WORKSHOP ---
 
 @Composable
+fun BiomechanicalSplicingDeck(
+    isSplicingActive: Boolean,
+    selectedSlot: AugmentSlot,
+    installedAugment: String,
+    logs: List<String>
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "splicing_deck")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 2f * Math.PI.toFloat(),
+        animationSpec = infiniteRepeatable(
+            animation = tween(if (isSplicingActive) 800 else 2500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
+
+    CyberCard(borderColor = if (isSplicingActive) QuantumNeonOrange else QuantumNeonBlue) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "🎛️ SPLICING AUDIO/VISUAL DECK",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isSplicingActive) QuantumNeonOrange else QuantumNeonBlue
+                    )
+                    if (isSplicingActive) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(QuantumNeonOrange)
+                        )
+                    }
+                }
+                Text(
+                    text = if (isSplicingActive) "STATUS: SPLICING MOD..." else "STATUS: DECK ONLINE",
+                    fontSize = 9.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = if (isSplicingActive) QuantumNeonOrange else QuantumNeonGreen,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(60.dp)
+                    .background(Color.Black.copy(alpha = 0.5f))
+                    .border(1.dp, QuantumBorder.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val width = size.width
+                    val height = size.height
+                    val centerY = height / 2f
+                    val pointsCount = 80
+                    val step = width / pointsCount
+
+                    val freqMultiplier = if (isSplicingActive) 3.5f else 1.2f
+                    val baseAmp = if (isSplicingActive) 20f else 8f
+
+                    val wavePath1 = androidx.compose.ui.graphics.Path()
+                    val wavePath2 = androidx.compose.ui.graphics.Path()
+
+                    for (i in 0..pointsCount) {
+                        val x = i * step
+                        val angle1 = (i.toFloat() / pointsCount) * 4f * Math.PI.toFloat() * freqMultiplier + phase
+                        val angle2 = (i.toFloat() / pointsCount) * 3.2f * Math.PI.toFloat() * freqMultiplier - phase
+
+                        val y1 = centerY + TrigLUT.sin(angle1) * (baseAmp * 1.2f)
+                        val y2 = centerY + TrigLUT.cos(angle2) * (baseAmp * 0.8f)
+
+                        if (i == 0) {
+                            wavePath1.moveTo(x, y1)
+                            wavePath2.moveTo(x, y2)
+                        } else {
+                            wavePath1.lineTo(x, y1)
+                            wavePath2.lineTo(x, y2)
+                        }
+                    }
+
+                    drawPath(
+                        path = wavePath1,
+                        color = if (isSplicingActive) QuantumNeonOrange else QuantumNeonBlue.copy(alpha = 0.8f),
+                        style = Stroke(width = if (isSplicingActive) 3f else 1.5f)
+                    )
+                    drawPath(
+                        path = wavePath2,
+                        color = if (isSplicingActive) QuantumNeonGreen else QuantumNeonPurple.copy(alpha = 0.5f),
+                        style = Stroke(width = 1f)
+                    )
+
+                    val scanX = (phase / (2f * Math.PI.toFloat())) * width
+                    drawLine(
+                        color = if (isSplicingActive) QuantumNeonOrange else QuantumNeonBlue.copy(alpha = 0.4f),
+                        start = Offset(scanX, 0f),
+                        end = Offset(scanX, height),
+                        strokeWidth = if (isSplicingActive) 3f else 1f
+                    )
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    Text(
+                        text = "FREQ: ${if (isSplicingActive) "220.5 kHz" else "48.0 kHz"} • AMP: ${if (isSplicingActive) "1.12V" else "0.15V"}",
+                        fontSize = 8.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color.Gray
+                    )
+                    Text(
+                        text = "DECK: BIOM_WAVE_SPLICER_v2.0",
+                        fontSize = 8.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color.Gray
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .background(Color.Black.copy(alpha = 0.3f))
+                        .border(1.dp, QuantumBorder, RoundedCornerShape(4.dp))
+                        .padding(6.dp)
+                ) {
+                    Text(
+                        text = "📊 DECK METRICS",
+                        fontSize = 8.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (isSplicingActive) QuantumNeonOrange else Color.Gray,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "TARGET: ${selectedSlot.displayName.uppercase()}",
+                        fontSize = 8.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = QuantumLightText
+                    )
+                    Text(
+                        text = "CHIP: ${installedAugment.uppercase()}",
+                        fontSize = 8.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = QuantumNeonGreen,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "SYNC: ${if (isSplicingActive) "CALIBRATING" else "SECURE [99.2%]"}",
+                        fontSize = 8.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (isSplicingActive) QuantumNeonOrange else QuantumNeonBlue
+                    )
+                }
+
+                Column(
+                    modifier = Modifier
+                        .weight(1.5f)
+                        .background(Color.Black.copy(alpha = 0.5f))
+                        .border(1.dp, QuantumBorder, RoundedCornerShape(4.dp))
+                        .padding(6.dp)
+                        .height(55.dp)
+                ) {
+                    Text(
+                        text = "🖥️ SPLICER DIAGNOSTICS",
+                        fontSize = 8.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (isSplicingActive) QuantumNeonOrange else Color.Gray,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    logs.take(2).forEach { log ->
+                        Text(
+                            text = log,
+                            fontSize = 8.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = if (isSplicingActive) QuantumNeonOrange else QuantumLightText,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun AugmentScreen(
     viewModel: GameViewModel,
     gameState: GameState
 ) {
-    var speechBubbleText by remember { mutableStateOf("Ready to configure cybernetics, Director!") }
+    var speechBubbleText by rememberSaveable { mutableStateOf("Ready to configure cybernetics, Director!") }
+    var selectedSlotName by rememberSaveable { mutableStateOf(AugmentSlot.QUANTUM_CORE.name) }
+    val selectedSlot = remember(selectedSlotName) { AugmentSlot.valueOf(selectedSlotName) }
+    var devPortalTab by rememberSaveable { mutableStateOf(0) } // 0 = GDScript, 1 = Kotlin, 2 = Setup
+    var showAltSlotsRow by rememberSaveable { mutableStateOf(true) }
+
+    var isSplicingActive by rememberSaveable { mutableStateOf(false) }
+    var splicingActiveTime by rememberSaveable { mutableLongStateOf(0L) }
+    var splicingLogsRaw by rememberSaveable { mutableStateOf("🛰️ System Online: Ready for Bio-Augmentation Splicing...") }
+    val splicingLogs = remember(splicingLogsRaw) { splicingLogsRaw.split("||") }
+
+    LaunchedEffect(splicingActiveTime) {
+        if (splicingActiveTime > 0) {
+            isSplicingActive = true
+            kotlinx.coroutines.delay(1500)
+            isSplicingActive = false
+        }
+    }
 
     LazyColumn(
         modifier = Modifier
@@ -3396,7 +5490,7 @@ fun AugmentScreen(
                 color = QuantumNeonBlue
             )
             Text(
-                text = "Upgrade mechanical chips, select high-precision weapons, or load specialized armor suits to optimize stats.",
+                text = "Configure high-precision biomechanical augment chips, weapons, and environmental armor suits to optimize stats.",
                 color = QuantumGrayText,
                 fontSize = 13.sp,
                 lineHeight = 18.sp
@@ -3474,7 +5568,550 @@ fun AugmentScreen(
             }
         }
 
-        // Weapon Selector
+        // Section: BIOMECHANICAL SPLICING AUDIO/VISUAL DECK (Immersion Upgrade)
+        item {
+            val equippedName = gameState.installedAugments[selectedSlot] ?: "None"
+            BiomechanicalSplicingDeck(
+                isSplicingActive = isSplicingActive,
+                selectedSlot = selectedSlot,
+                installedAugment = equippedName,
+                logs = splicingLogs
+            )
+        }
+
+        // Section: INTERACTIVE CYBER-SKELETAL SCHEMATIC
+        item {
+            Text(
+                text = "INTERACTIVE SKELETAL SCHEMATIC",
+                color = QuantumNeonBlue,
+                fontSize = 15.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold
+            )
+        }
+
+        item {
+            CyberCard(borderColor = QuantumNeonBlue) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        text = "🧬 TAP NODES TO PROFILE & CUSTOMIZE SLOTS",
+                        color = QuantumNeonOrange,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    BoxWithConstraints(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(240.dp)
+                            .background(Color.Black.copy(alpha = 0.4f))
+                            .border(1.dp, QuantumBorder.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
+                    ) {
+                        val infiniteTransition = rememberInfiniteTransition(label = "blueprint_spark")
+                        val pulseProgress by infiniteTransition.animateFloat(
+                            initialValue = 0f,
+                            targetValue = 1f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(2500, easing = LinearEasing),
+                                repeatMode = RepeatMode.Restart
+                            ),
+                            label = "spark"
+                        )
+
+                        val blueprintScanTransition = rememberInfiniteTransition(label = "blueprint_scan_trans")
+                        val blueprintScanProgress by blueprintScanTransition.animateFloat(
+                            initialValue = 0f,
+                            targetValue = 1f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(if (isSplicingActive) 1000 else 3500, easing = LinearEasing),
+                                repeatMode = RepeatMode.Restart
+                            ),
+                            label = "blueprint_scan"
+                        )
+
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val centerX = size.width / 2f
+                            val centerY = size.height / 2f
+
+                            // Draw subtle grid
+                            val gridSpacing = 20.dp.toPx()
+                            for (x in 0..(size.width / gridSpacing).toInt()) {
+                                drawLine(
+                                    color = QuantumNeonBlue.copy(alpha = 0.05f),
+                                    start = Offset(x * gridSpacing, 0f),
+                                    end = Offset(x * gridSpacing, size.height),
+                                    strokeWidth = 1f
+                                )
+                            }
+                            for (y in 0..(size.height / gridSpacing).toInt()) {
+                                drawLine(
+                                    color = QuantumNeonBlue.copy(alpha = 0.05f),
+                                    start = Offset(0f, y * gridSpacing),
+                                    end = Offset(size.width, y * gridSpacing),
+                                    strokeWidth = 1f
+                                )
+                            }
+
+                            // Draw high-fidelity laser scanning sweeps (A/V Upgrade)
+                            val scanY = size.height * blueprintScanProgress
+                            drawLine(
+                                color = if (isSplicingActive) QuantumNeonOrange.copy(alpha = 0.8f) else QuantumNeonBlue.copy(alpha = 0.25f),
+                                start = Offset(0f, scanY),
+                                end = Offset(size.width, scanY),
+                                strokeWidth = if (isSplicingActive) 3f else 1.5f
+                            )
+                            drawRect(
+                                color = if (isSplicingActive) QuantumNeonOrange.copy(alpha = 0.12f) else QuantumNeonBlue.copy(alpha = 0.04f),
+                                topLeft = Offset(0f, scanY - (if (isSplicingActive) 12f else 6f)),
+                                size = androidx.compose.ui.geometry.Size(size.width, if (isSplicingActive) 24f else 12f)
+                            )
+
+                            // Define skeletal node coordinates in canvas space
+                            val headY = size.height * 0.16f
+                            val torsoY = size.height * 0.35f
+                            val coreY = size.height * 0.52f
+                            val armsY = size.height * 0.38f
+                            val legsY = size.height * 0.78f
+
+                            val coords = mapOf(
+                                AugmentSlot.CRANIAL to Offset(centerX, headY),
+                                AugmentSlot.SENSORY to Offset(centerX - size.width * 0.14f, headY + 15f),
+                                AugmentSlot.TORSO to Offset(centerX, torsoY),
+                                AugmentSlot.QUANTUM_CORE to Offset(centerX, coreY),
+                                AugmentSlot.ARMS to Offset(centerX - size.width * 0.28f, armsY + 10f),
+                                AugmentSlot.LEGS to Offset(centerX - size.width * 0.14f, legsY),
+                                AugmentSlot.DERMAL to Offset(centerX + size.width * 0.28f, armsY + 10f)
+                            )
+
+                            // Draw chassis bones outline
+                            // Head to pelvis
+                            drawLine(
+                                color = QuantumNeonBlue.copy(alpha = 0.25f),
+                                start = Offset(centerX, headY),
+                                end = Offset(centerX, legsY - 20f),
+                                strokeWidth = 4f
+                            )
+                            // Shoulder horizontal
+                            drawLine(
+                                color = QuantumNeonBlue.copy(alpha = 0.25f),
+                                start = Offset(centerX - size.width * 0.25f, armsY),
+                                end = Offset(centerX + size.width * 0.25f, armsY),
+                                strokeWidth = 3f
+                            )
+                            // Hips horizontal
+                            drawLine(
+                                color = QuantumNeonBlue.copy(alpha = 0.25f),
+                                start = Offset(centerX - size.width * 0.14f, legsY - 20f),
+                                end = Offset(centerX + size.width * 0.14f, legsY - 20f),
+                                strokeWidth = 3f
+                            )
+                            // Left Arm
+                            drawLine(
+                                color = QuantumNeonBlue.copy(alpha = 0.2f),
+                                start = Offset(centerX - size.width * 0.25f, armsY),
+                                end = coords[AugmentSlot.ARMS]!!,
+                                strokeWidth = 2.5f
+                            )
+                            // Right Arm / Dermal port side
+                            drawLine(
+                                color = QuantumNeonBlue.copy(alpha = 0.2f),
+                                start = Offset(centerX + size.width * 0.25f, armsY),
+                                end = coords[AugmentSlot.DERMAL]!!,
+                                strokeWidth = 2.5f
+                            )
+                            // Left Leg
+                            drawLine(
+                                color = QuantumNeonBlue.copy(alpha = 0.2f),
+                                start = Offset(centerX - size.width * 0.14f, legsY - 20f),
+                                end = coords[AugmentSlot.LEGS]!!,
+                                strokeWidth = 2.5f
+                            )
+                            // Right Leg symmetrical line
+                            drawLine(
+                                color = QuantumNeonBlue.copy(alpha = 0.2f),
+                                start = Offset(centerX + size.width * 0.14f, legsY - 20f),
+                                end = Offset(centerX + size.width * 0.14f, legsY),
+                                strokeWidth = 2.5f
+                            )
+
+                            // Draw circuit energy conduit vectors to core (Quantum Core)
+                            val coreOffset = coords[AugmentSlot.QUANTUM_CORE]!!
+                            coords.forEach { (slot, coord) ->
+                                if (slot != AugmentSlot.QUANTUM_CORE) {
+                                    val isSelected = slot == selectedSlot
+                                    // Conduit lines
+                                    drawLine(
+                                        color = if (isSelected) QuantumNeonOrange.copy(alpha = 0.6f) else QuantumNeonBlue.copy(alpha = 0.15f),
+                                        start = coord,
+                                        end = coreOffset,
+                                        strokeWidth = if (isSelected) 3f else 1.5f,
+                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 8f), 0f)
+                                    )
+
+                                    // Moving sparks traveling to Quantum Core
+                                    val sparkX = coord.x + (coreOffset.x - coord.x) * pulseProgress
+                                    val sparkY = coord.y + (coreOffset.y - coord.y) * pulseProgress
+                                    drawCircle(
+                                        color = if (isSelected) QuantumNeonOrange else QuantumNeonBlue,
+                                        radius = if (isSelected) 4.5f else 3f,
+                                        center = Offset(sparkX, sparkY)
+                                    )
+                                }
+                            }
+
+                            // Render glow indicators on the canvas at node positions
+                            coords.forEach { (slot, coord) ->
+                                val isSelected = slot == selectedSlot
+                                drawCircle(
+                                    color = if (isSelected) QuantumNeonOrange.copy(alpha = 0.3f) else QuantumNeonBlue.copy(alpha = 0.1f),
+                                    radius = if (isSelected) 18f else 10f,
+                                    center = coord
+                                )
+                                drawCircle(
+                                    color = if (isSelected) QuantumNeonOrange else QuantumNeonBlue.copy(alpha = 0.7f),
+                                    radius = if (isSelected) 10f else 6f,
+                                    center = coord,
+                                    style = Stroke(width = 2f)
+                                )
+
+                                // Dynamic calibration scan radiating pulse centered on selected node
+                                if (isSelected && isSplicingActive) {
+                                    drawCircle(
+                                        color = QuantumNeonOrange.copy(alpha = 0.5f * (1f - blueprintScanProgress)),
+                                        radius = 12f + (blueprintScanProgress * 45f),
+                                        center = coord,
+                                        style = Stroke(width = 2f)
+                                    )
+                                }
+                            }
+                        }
+
+                        // Overlay Interactive 48dp Touch Targets using BiasAlignment
+                        SkeletalNodeButton(AugmentSlot.CRANIAL, selectedSlot, { selectedSlotName = AugmentSlot.CRANIAL.name; speechBubbleText = "Calibrating synaptic nodes. Cranial Overclock ready, Director." }, 0f, -0.68f)
+                        SkeletalNodeButton(AugmentSlot.SENSORY, selectedSlot, { selectedSlotName = AugmentSlot.SENSORY.name; speechBubbleText = "Aura sweep filters loaded. Active hazard tracking operational." }, -0.28f, -0.55f)
+                        SkeletalNodeButton(AugmentSlot.TORSO, selectedSlot, { selectedSlotName = AugmentSlot.TORSO.name; speechBubbleText = "Shock dampers activated. Torso chassis deflection rate high." }, 0f, -0.3f)
+                        SkeletalNodeButton(AugmentSlot.QUANTUM_CORE, selectedSlot, { selectedSlotName = AugmentSlot.QUANTUM_CORE.name; speechBubbleText = "Quantum core reactor spinning. Energy reserves fully balanced." }, 0f, 0.04f)
+                        SkeletalNodeButton(AugmentSlot.ARMS, selectedSlot, { selectedSlotName = AugmentSlot.ARMS.name; speechBubbleText = "Power joints pre-loaded. Arm actuator strike vector aligned." }, -0.56f, -0.3f)
+                        SkeletalNodeButton(AugmentSlot.LEGS, selectedSlot, { selectedSlotName = AugmentSlot.LEGS.name; speechBubbleText = "Graviton compression cells online. Jump dampening matrix: active." }, -0.28f, 0.56f)
+                        SkeletalNodeButton(AugmentSlot.DERMAL, selectedSlot, { selectedSlotName = AugmentSlot.DERMAL.name; speechBubbleText = "Adaptive light camouflage and dynamic dermal shielding calibrated." }, 0.56f, -0.3f)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "SELECTED: ${selectedSlot.displayName.uppercase()} [ ${selectedSlot.category.uppercase()} ]",
+                        color = QuantumLightText,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        }
+
+        // Section: BIO-MECHANICAL HERO SLOT CUSTOMIZER DECK
+        item {
+            val equippedName = gameState.installedAugments[selectedSlot] ?: "None"
+            CyberCard(borderColor = QuantumNeonOrange) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "⚙️ SOCKET MODULATOR: ${selectedSlot.displayName.uppercase()}",
+                            color = QuantumNeonOrange,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Box(
+                            modifier = Modifier
+                                .background(QuantumNeonOrange.copy(alpha = 0.1f))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                .border(1.dp, QuantumNeonOrange.copy(alpha = 0.5f))
+                        ) {
+                            Text(
+                                text = "ACTIVE: $equippedName",
+                                color = QuantumNeonOrange,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    val possibleAugments = getRepositoryAugmentsForSlot(selectedSlot)
+                    possibleAugments.forEach { chip ->
+                        val alreadyInstalled = equippedName == chip.name
+                        CyberCard(borderColor = if (alreadyInstalled) QuantumNeonGreen else QuantumBorder.copy(alpha = 0.5f)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = chip.name,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        color = if (alreadyInstalled) QuantumNeonGreen else QuantumLightText
+                                    )
+                                    Text(
+                                        text = chip.modifierDesc,
+                                        fontSize = 11.sp,
+                                        color = QuantumGrayText
+                                    )
+                                    
+                                    // Display bonus values
+                                    val bonuses = listOfNotNull(
+                                        if (chip.hpBonus > 0) "+${chip.hpBonus} HP" else null,
+                                        if (chip.mpBonus > 0) "+${chip.mpBonus} MP" else null,
+                                        if (chip.atkBonus > 0) "+${chip.atkBonus} ATK" else null,
+                                        if (chip.defBonus > 0) "+${chip.defBonus} DEF" else null,
+                                        if (chip.magBonus > 0) "+${chip.magBonus} MAG" else null,
+                                        if (chip.spdBonus > 0) "+${chip.spdBonus} SPD" else null,
+                                        if (chip.lckBonus > 0) "+${chip.lckBonus} LCK" else null
+                                    )
+                                    if (bonuses.isNotEmpty()) {
+                                        Text(
+                                            text = "STATS: ${bonuses.joinToString(" • ")}",
+                                            fontSize = 9.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = QuantumNeonGreen,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                                
+                                Spacer(modifier = Modifier.width(10.dp))
+
+                                if (alreadyInstalled) {
+                                    CyberButton(
+                                        onClick = {
+                                            viewModel.installAugment(selectedSlot, "None")
+                                            speechBubbleText = "✓ Unplugged module from ${selectedSlot.displayName}!"
+                                            splicingActiveTime = System.currentTimeMillis()
+                                            val nextLogs = listOf("⚠️ [SYS_EJECT] Cleared module from ${selectedSlot.displayName.uppercase()}", "🔗 Realigning biometric feedback loop...") + splicingLogs.take(3)
+                                            splicingLogsRaw = nextLogs.joinToString("||")
+                                        },
+                                        text = "Eject",
+                                        color = QuantumNeonRed.copy(alpha = 0.8f),
+                                        modifier = Modifier.width(64.dp)
+                                    )
+                                } else {
+                                    CyberButton(
+                                        onClick = {
+                                            viewModel.installAugment(selectedSlot, chip.name)
+                                            speechBubbleText = "✓ Plugged ${chip.name} into ${selectedSlot.displayName}!"
+                                            splicingActiveTime = System.currentTimeMillis()
+                                            val nextLogs = listOf("⚡ [SYS_SPLICE] Spliced ${chip.name.uppercase()} to ${selectedSlot.displayName.uppercase()}", "🔥 Overclocking auxiliary micro-servos...") + splicingLogs.take(3)
+                                            splicingLogsRaw = nextLogs.joinToString("||")
+                                        },
+                                        text = "Plug",
+                                        color = QuantumNeonGreen,
+                                        modifier = Modifier.width(64.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                    }
+
+                    // Quick-Select other slots
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "QUICK ALTER ALTERNATIVE SLOTS:",
+                            color = QuantumGrayText,
+                            fontSize = 8.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text = if (showAltSlotsRow) "Hide" else "Show",
+                            color = QuantumNeonOrange,
+                            fontSize = 8.sp,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.clickable { showAltSlotsRow = !showAltSlotsRow }
+                        )
+                    }
+                    
+                    if (showAltSlotsRow) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            AugmentSlot.entries.forEach { slot ->
+                                val active = slot == selectedSlot
+                                Box(
+                                    modifier = Modifier
+                                        .background(if (active) QuantumNeonOrange.copy(alpha = 0.2f) else Color.Black)
+                                        .border(1.dp, if (active) QuantumNeonOrange else QuantumBorder)
+                                        .clickable { selectedSlotName = slot.name }
+                                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text(
+                                        text = slot.displayName.split(" ")[0].uppercase(),
+                                        color = if (active) QuantumNeonOrange else Color.Gray,
+                                        fontSize = 9.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Section: BIO-MECHANICAL DEVELOPER SUITE (GODOT & KOTLIN)
+        item {
+            CyberCard(borderColor = QuantumNeonPurple) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "⚙️ BIO-SKELETAL DEVELOPMENT PORTAL",
+                            color = QuantumNeonPurple,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                        
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            listOf("GDScript", "Kotlin", "Setup").forEachIndexed { index, label ->
+                                Box(
+                                    modifier = Modifier
+                                        .background(if (devPortalTab == index) QuantumNeonPurple.copy(alpha = 0.15f) else Color.Transparent)
+                                        .border(1.dp, if (devPortalTab == index) QuantumNeonPurple else Color.Transparent)
+                                        .clickable { devPortalTab = index }
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = label,
+                                        color = if (devPortalTab == index) QuantumNeonPurple else Color.Gray,
+                                        fontSize = 8.5.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    when (devPortalTab) {
+                        0 -> {
+                            Text(
+                                text = "COOP ENGINE CODE [ ${selectedSlot.displayName.uppercase()} MANAGER ]",
+                                color = QuantumLightText,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "High-efficiency mobile-friendly Godot 4.x script for dynamic bio-slots ticking and property propagation:",
+                                color = QuantumGrayText,
+                                fontSize = 8.sp
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = getGdscriptCodeForSlot(selectedSlot),
+                                color = QuantumNeonGreen,
+                                fontSize = 8.sp,
+                                fontFamily = FontFamily.Monospace,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState())
+                                    .background(Color.Black.copy(alpha = 0.6f))
+                                    .padding(8.dp)
+                                    .border(1.dp, QuantumBorder)
+                            )
+                        }
+                        1 -> {
+                            Text(
+                                text = "JETPACK COMPOSE CONTROLLER EQUIVALENT",
+                                color = QuantumLightText,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "StateFlow reactive tracker with pre-allocated local graphics context structures for high-frame rates:",
+                                color = QuantumGrayText,
+                                fontSize = 8.sp
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = getKotlinCodeForSlot(selectedSlot),
+                                color = QuantumNeonBlue,
+                                fontSize = 8.sp,
+                                fontFamily = FontFamily.Monospace,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState())
+                                    .background(Color.Black.copy(alpha = 0.6f))
+                                    .padding(8.dp)
+                                    .border(1.dp, QuantumBorder)
+                            )
+                        }
+                        2 -> {
+                            Text(
+                                text = "GODOT 4.X SCENE SETUP DIRECTIVES",
+                                color = QuantumLightText,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            val setupSteps = getGodotSetupStepsForSlot(selectedSlot)
+                            setupSteps.forEachIndexed { i, step ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = "[${i + 1}]",
+                                        color = QuantumNeonPurple,
+                                        fontSize = 8.5.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = step,
+                                        color = Color.LightGray,
+                                        fontSize = 8.5.sp,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Section: WEAPON SYSTEMS
         item {
             Text(
                 text = "WEAPON SYSTEMS",
@@ -3541,7 +6178,7 @@ fun AugmentScreen(
             }
         }
 
-        // Suit / Outfit Selector
+        // Section: TACTICAL OUTFITS
         item {
             Text(
                 text = "TACTICAL OUTFITS",
@@ -3602,105 +6239,7 @@ fun AugmentScreen(
             }
         }
 
-        // Cybernetic Slots Customizer
-        item {
-            Text(
-                text = "CYBERNETIC CORES",
-                color = QuantumNeonBlue,
-                fontSize = 15.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold
-            )
-        }
-
-        items(AugmentSlot.entries) { slot ->
-            val equippedName = gameState.installedAugments[slot] ?: "None"
-            var expanded by remember { mutableStateOf(false) }
-
-            CyberCard(borderColor = QuantumBorder) {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text(
-                                text = slot.displayName.uppercase(),
-                                fontSize = 13.sp,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.Bold,
-                                color = QuantumNeonBlue
-                            )
-                            Text(
-                                text = "Module: $equippedName",
-                                color = QuantumLightText,
-                                fontSize = 14.sp
-                            )
-                        }
-                        CyberButton(
-                            onClick = { expanded = !expanded },
-                            text = if (expanded) "Close" else "Alter",
-                            color = QuantumNeonBlue,
-                            modifier = Modifier.width(80.dp)
-                        )
-                    }
-
-                    if (expanded) {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        HorizontalDivider(color = QuantumBorder)
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        val possibleAugments = getRepositoryAugmentsForSlot(slot)
-                        possibleAugments.forEach { chip ->
-                            val alreadyInstalled = equippedName == chip.name
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = chip.name,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 13.sp,
-                                        color = if (alreadyInstalled) QuantumNeonGreen else QuantumLightText
-                                    )
-                                    Text(
-                                        text = chip.modifierDesc,
-                                        fontSize = 11.sp,
-                                        color = QuantumGrayText
-                                    )
-                                }
-                                if (alreadyInstalled) {
-                                    Text(
-                                        text = "INSTALLED",
-                                        color = QuantumNeonGreen,
-                                        fontSize = 10.sp,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                } else {
-                                    CyberButton(
-                                        onClick = {
-                                            viewModel.installAugment(slot, chip.name)
-                                            expanded = false
-                                        },
-                                        text = "Plug",
-                                        color = QuantumNeonGreen,
-                                        modifier = Modifier.width(60.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Mod Chips Customizer
+        // Section: MOD CHIPS INTEGRATOR
         item {
             Text(
                 text = "MOD CHIPS INTEGRATOR",
@@ -3754,40 +6293,40 @@ fun AugmentScreen(
 private fun getRepositoryAugmentsForSlot(slot: AugmentSlot): List<AugmentChip> {
     return listOf(
         // Cranial
-        AugmentChip("Neural Processor", AugmentSlot.CRANIAL, "+15 ATK, overclock mental reasoning", atkBonus = 15, magBonus = 10),
-        AugmentChip("Memory Expansion", AugmentSlot.CRANIAL, "+40 MP, increases timeline recall", mpBonus = 40),
-        AugmentChip("Focus Amplifier", AugmentSlot.CRANIAL, "+20 MAG, concentrates resonance waves", magBonus = 20),
-        AugmentChip("Vision Suite", AugmentSlot.CRANIAL, "+10 LCK, highlights tactical anomalies", lckBonus = 10),
+        AugmentChip("Neural Processor", AugmentSlot.CRANIAL, "+15 ATK, overclock mental reasoning", 0, 0, 15, 0, 10, 0, 0),
+        AugmentChip("Memory Expansion", AugmentSlot.CRANIAL, "+40 MP, increases timeline recall", 0, 40, 0, 0, 0, 0, 0),
+        AugmentChip("Focus Amplifier", AugmentSlot.CRANIAL, "+20 MAG, concentrates resonance waves", 0, 0, 0, 0, 20, 0, 0),
+        AugmentChip("Vision Suite", AugmentSlot.CRANIAL, "+10 LCK, highlights tactical anomalies", 0, 0, 0, 0, 0, 0, 10),
         // Torso
-        AugmentChip("Signal Heart", AugmentSlot.TORSO, "+100 HP, enhances adrenaline pumps", hpBonus = 100),
-        AugmentChip("Lung Reinforcement", AugmentSlot.TORSO, "+20 DEF, mitigates toxic atmospheres", defBonus = 20),
-        AugmentChip("Nano Fiber Mesh", AugmentSlot.TORSO, "+50 HP, absorbing kinetic shock", hpBonus = 50, defBonus = 10),
-        AugmentChip("Bio-Reactor", AugmentSlot.TORSO, "+20 MP & +15 ATK, fuels biomechanics", mpBonus = 20, atkBonus = 15),
+        AugmentChip("Signal Heart", AugmentSlot.TORSO, "+100 HP, enhances adrenaline pumps", 100, 0, 0, 0, 0, 0, 0),
+        AugmentChip("Lung Reinforcement", AugmentSlot.TORSO, "+20 DEF, mitigates toxic atmospheres", 0, 0, 0, 20, 0, 0, 0),
+        AugmentChip("Nano Fiber Mesh", AugmentSlot.TORSO, "+50 HP, absorbing kinetic shock", 50, 0, 0, 10, 0, 0, 0),
+        AugmentChip("Bio-Reactor", AugmentSlot.TORSO, "+20 MP & +15 ATK, fuels biomechanics", 0, 20, 15, 0, 0, 0, 0),
         // Arms
-        AugmentChip("Cybernetic Muscles", AugmentSlot.ARMS, "+30 ATK, hydraulic punches", atkBonus = 30),
-        AugmentChip("Smart Servo-Joint", AugmentSlot.ARMS, "+15 SPD, quick combat draw", spdBonus = 15),
-        AugmentChip("Tactical Interface", AugmentSlot.ARMS, "+15 ATK & +10 MAG, lock-on targeting", atkBonus = 15, magBonus = 10),
-        AugmentChip("Weapon Mount", AugmentSlot.ARMS, "+25 ATK, heavy stabilizer chassis", atkBonus = 25),
+        AugmentChip("Cybernetic Muscles", AugmentSlot.ARMS, "+30 ATK, hydraulic punches", 0, 0, 30, 0, 0, 0, 0),
+        AugmentChip("Smart Servo-Joint", AugmentSlot.ARMS, "+15 SPD, quick combat draw", 0, 0, 0, 0, 0, 15, 0),
+        AugmentChip("Tactical Interface", AugmentSlot.ARMS, "+15 ATK & +10 MAG, lock-on targeting", 0, 0, 15, 0, 10, 0, 0),
+        AugmentChip("Weapon Mount", AugmentSlot.ARMS, "+25 ATK, heavy stabilizer chassis", 0, 0, 25, 0, 0, 0, 0),
         // Legs
-        AugmentChip("Magnetic Boosters", AugmentSlot.LEGS, "+25 SPD, slide on scrap metals", spdBonus = 25),
-        AugmentChip("Shock Absorbers", AugmentSlot.LEGS, "+50 HP, safe leap down from buildings", hpBonus = 50),
-        AugmentChip("Graviton Stabilizer", AugmentSlot.LEGS, "+15 DEF & +10 LCK, gravity defying steps", defBonus = 15, lckBonus = 10),
-        AugmentChip("Silent Step System", AugmentSlot.LEGS, "+20 SPD, sound dampening soles", spdBonus = 20),
+        AugmentChip("Magnetic Boosters", AugmentSlot.LEGS, "+25 SPD, slide on scrap metals", 0, 0, 0, 0, 0, 25, 0),
+        AugmentChip("Shock Absorbers", AugmentSlot.LEGS, "+50 HP, safe leap down from buildings", 50, 0, 0, 0, 0, 0, 0),
+        AugmentChip("Graviton Stabilizer", AugmentSlot.LEGS, "+15 DEF & +10 LCK, gravity defying steps", 0, 0, 0, 15, 0, 0, 10),
+        AugmentChip("Silent Step System", AugmentSlot.LEGS, "+20 SPD, sound dampening soles", 0, 0, 0, 0, 0, 20, 0),
         // Sensory
-        AugmentChip("Quantum Eye", AugmentSlot.SENSORY, "+30 MAG, sees light wave emissions", magBonus = 30),
-        AugmentChip("Audio Enhancer", AugmentSlot.SENSORY, "+10 SPD & +10 LCK, listens to radio bands", spdBonus = 10, lckBonus = 10),
-        AugmentChip("Threat Scanner", AugmentSlot.SENSORY, "+15 DEF, tactical danger overlay", defBonus = 15),
-        AugmentChip("Datajack", AugmentSlot.SENSORY, "+15 MAG, instant network link", magBonus = 15),
+        AugmentChip("Quantum Eye", AugmentSlot.SENSORY, "+30 MAG, sees light wave emissions", 0, 0, 0, 0, 30, 0, 0),
+        AugmentChip("Audio Enhancer", AugmentSlot.SENSORY, "+10 SPD & +10 LCK, listens to radio bands", 0, 0, 0, 0, 0, 10, 10),
+        AugmentChip("Threat Scanner", AugmentSlot.SENSORY, "+15 DEF, tactical danger overlay", 0, 0, 0, 15, 0, 0, 0),
+        AugmentChip("Datajack", AugmentSlot.SENSORY, "+15 MAG, instant network link", 0, 0, 0, 0, 15, 0, 0),
         // Dermal
-        AugmentChip("Adaptive Armor Skin", AugmentSlot.DERMAL, "+30 DEF, scales resist bullets", defBonus = 30),
-        AugmentChip("Thermal Regulation", AugmentSlot.DERMAL, "+50 HP, works in lava/glacier biomes", hpBonus = 50),
-        AugmentChip("Nano-Heal Layer", AugmentSlot.DERMAL, "Regenerates HP constantly, +15 DEF", defBonus = 15),
-        AugmentChip("Camouflage Mesh", AugmentSlot.DERMAL, "+15 SPD, adapts color to shadows", spdBonus = 15),
+        AugmentChip("Adaptive Armor Skin", AugmentSlot.DERMAL, "+30 DEF, scales resist bullets", 0, 0, 0, 30, 0, 0, 0),
+        AugmentChip("Thermal Regulation", AugmentSlot.DERMAL, "+50 HP, works in lava/glacier biomes", 50, 0, 0, 0, 0, 0, 0),
+        AugmentChip("Nano-Heal Layer", AugmentSlot.DERMAL, "Regenerates HP constantly, +15 DEF", 0, 0, 0, 15, 0, 0, 0),
+        AugmentChip("Camouflage Mesh", AugmentSlot.DERMAL, "+15 SPD, adapts color to shadows", 0, 0, 0, 0, 0, 15, 0),
         // Quantum Core
-        AugmentChip("Resonance Core", AugmentSlot.QUANTUM_CORE, "+20 ATK, +20 MAG, stable alignment", atkBonus = 20, magBonus = 20),
-        AugmentChip("Quantum Capacitor", AugmentSlot.QUANTUM_CORE, "+50 MP, condensed energy pool", mpBonus = 50),
-        AugmentChip("Energy Conduit", AugmentSlot.QUANTUM_CORE, "+100 HP, rapid current distribution", hpBonus = 100),
-        AugmentChip("Warp Stabilizer", AugmentSlot.QUANTUM_CORE, "+15 LCK, keeps coordinates safe", lckBonus = 15)
+        AugmentChip("Resonance Core", AugmentSlot.QUANTUM_CORE, "+20 ATK, +20 MAG, stable alignment", 0, 0, 20, 0, 20, 0, 0),
+        AugmentChip("Quantum Capacitor", AugmentSlot.QUANTUM_CORE, "+50 MP, condensed energy pool", 0, 50, 0, 0, 0, 0, 0),
+        AugmentChip("Energy Conduit", AugmentSlot.QUANTUM_CORE, "+100 HP, rapid current distribution", 100, 0, 0, 0, 0, 0, 0),
+        AugmentChip("Warp Stabilizer", AugmentSlot.QUANTUM_CORE, "+15 LCK, keeps coordinates safe", 0, 0, 0, 0, 0, 0, 15)
     ).filter { it.slot == slot }
 }
 
@@ -3798,136 +6337,472 @@ fun FactionsScreen(
     viewModel: GameViewModel,
     gameState: GameState
 ) {
-    LazyColumn(
+    var selectedTab by remember { mutableStateOf(0) } // 0 = Standings, 1 = Quests Board, 2 = Dialogue Matrix
+
+    Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+            .padding(16.dp)
     ) {
-        item {
-            Text(
-                text = "FACTION LEDGER",
-                fontSize = 24.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                color = QuantumNeonOrange
+        // Tab Selector Row
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            CyberButton(
+                onClick = { selectedTab = 0 },
+                text = "STANDINGS",
+                color = if (selectedTab == 0) QuantumNeonOrange else Color.Gray,
+                modifier = Modifier.weight(1f)
             )
-            Text(
-                text = "Check alignment standing. Earn Faction Points by conducting specialized operations and trade routes.",
-                color = QuantumGrayText,
-                fontSize = 13.sp,
-                lineHeight = 18.sp
+            CyberButton(
+                onClick = { selectedTab = 1 },
+                text = "QUESTS BOARD",
+                color = if (selectedTab == 1) QuantumNeonBlue else Color.Gray,
+                modifier = Modifier.weight(1f)
             )
-            Spacer(modifier = Modifier.height(8.dp))
+            CyberButton(
+                onClick = { selectedTab = 2 },
+                text = "DIALOGUE MATRIX",
+                color = if (selectedTab == 2) QuantumNeonPurple else Color.Gray,
+                modifier = Modifier.weight(1f)
+            )
         }
 
-        items(Faction.entries) { faction ->
-            val points = gameState.factionReputations[faction] ?: 0
-            val tier = when {
-                points <= -500 -> ReputationTier.HATED
-                points <= -100 -> ReputationTier.HOSTILE
-                points < 500 -> ReputationTier.NEUTRAL
-                points < 1000 -> ReputationTier.FAVORABLE
-                else -> ReputationTier.REVERED
-            }
-
-            CyberCard(borderColor = faction.color) {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text(
-                                text = faction.displayName.uppercase(),
-                                fontSize = 17.sp,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.Bold,
-                                color = faction.color
-                            )
-                            Text(
-                                text = "Base Coordinate: ${faction.baseLocation}",
-                                color = QuantumGrayText,
-                                fontSize = 11.sp
-                            )
-                        }
-
+        if (selectedTab == 2) {
+            FactionDialogueMatrixView(viewModel = viewModel, gameState = gameState)
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                if (selectedTab == 0) {
+                    item {
                         Text(
-                            text = tier.title.uppercase(),
-                            color = tier.color,
-                            fontSize = 12.sp,
+                            text = "FACTION STANDINGS",
+                            fontSize = 24.sp,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
-                            modifier = Modifier
-                                .background(tier.color.copy(alpha = 0.15f))
-                                .border(1.dp, tier.color, RoundedCornerShape(3.dp))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                            color = QuantumNeonOrange
                         )
+                        Text(
+                            text = "Check alignment standing. Earn Faction Points by conducting specialized operations, resolving quests, and trading.",
+                            color = QuantumGrayText,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
                     }
 
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = faction.shortDesc,
-                        fontSize = 13.sp,
-                        color = QuantumLightText.copy(alpha = 0.85f),
-                        lineHeight = 17.sp
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "Alignment: ${faction.alignment}",
-                        fontSize = 11.sp,
-                        color = QuantumGrayText,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    Text(
-                        text = "Perk Unlocked: ${faction.perkName} (${faction.perkDesc})",
-                        fontSize = 11.sp,
-                        color = QuantumNeonGreen,
-                        fontFamily = FontFamily.Monospace
-                    )
+                    items(Faction.entries) { faction ->
+                        val points = gameState.factionReputations[faction] ?: 0
+                        val tier = when {
+                            points <= -500 -> ReputationTier.HATED
+                            points <= -100 -> ReputationTier.HOSTILE
+                            points < 500 -> ReputationTier.NEUTRAL
+                            points < 1000 -> ReputationTier.FAVORABLE
+                            else -> ReputationTier.REVERED
+                        }
 
-                    Spacer(modifier = Modifier.height(10.dp))
-                    CyberProgressBar(
-                        progress = (points + 1000f) / 2000f, // Map -1000..1000 to 0..1
-                        label = "STAMP STANDING",
-                        valueText = "$points / 1000 FP",
-                        color = faction.color
-                    )
+                        CyberCard(borderColor = Color(faction.color)) {
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column {
+                                        Text(
+                                            text = faction.displayName.uppercase(),
+                                            fontSize = 17.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(faction.color)
+                                        )
+                                        Text(
+                                            text = "Base Coordinate: ${faction.baseLocation}",
+                                            color = QuantumGrayText,
+                                            fontSize = 11.sp
+                                        )
+                                    }
 
-                    Spacer(modifier = Modifier.height(12.dp))
-                    HorizontalDivider(color = QuantumBorder)
-                    Spacer(modifier = Modifier.height(8.dp))
+                                    val tierColor = Color(tier.color)
+                                    Text(
+                                        text = tier.title.uppercase(),
+                                        color = tierColor,
+                                        fontSize = 12.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier
+                                            .background(tierColor.copy(alpha = 0.15f))
+                                            .border(1.dp, tierColor, RoundedCornerShape(3.dp))
+                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
 
-                    Text(
-                        text = "COMMISSION CONTRACTS",
-                        color = QuantumGrayText,
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = faction.shortDesc,
+                                    fontSize = 13.sp,
+                                    color = QuantumLightText.copy(alpha = 0.85f),
+                                    lineHeight = 17.sp
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = "Alignment: ${faction.alignment}",
+                                    fontSize = 11.sp,
+                                    color = QuantumGrayText,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Text(
+                                    text = "Perk Unlocked: ${faction.perkName} (${faction.perkDesc})",
+                                    fontSize = 11.sp,
+                                    color = QuantumNeonGreen,
+                                    fontFamily = FontFamily.Monospace
+                                )
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        CyberButton(
-                            onClick = {
-                                viewModel.completePOIMission("Solis Prime Sector")
-                            },
-                            text = "Tactical Intel",
-                            color = faction.color,
-                            modifier = Modifier.weight(1f)
+                                Spacer(modifier = Modifier.height(10.dp))
+                                CyberProgressBar(
+                                    progress = (points + 1000f) / 2000f, // Map -1000..1000 to 0..1
+                                    label = "STAND STANDING",
+                                    valueText = "$points / 1000 FP",
+                                    color = Color(faction.color)
+                                )
+
+                                // --- FACTION VENDOR SECTION ---
+                                val repThreshold = when (faction) {
+                                    Faction.AURELIAN_ORDER -> 200
+                                    Faction.EMBERPACT -> 200
+                                    Faction.SILENT_VEIL -> 150
+                                    else -> 100
+                                }
+                                val itemToUnlock = when (faction) {
+                                    Faction.AURELIAN_ORDER -> "Aurelian Shield Grid (+40 DEF)"
+                                    Faction.EMBERPACT -> "Overclocked Plasma Core (+35 ATK)"
+                                    Faction.SILENT_VEIL -> "Infiltration Dagger (+25 ATK, +15 SPD)"
+                                    else -> "Standard Nanite Charger"
+                                }
+                                val itemPrice = when (faction) {
+                                    Faction.AURELIAN_ORDER -> 500
+                                    Faction.EMBERPACT -> 600
+                                    Faction.SILENT_VEIL -> 450
+                                    else -> 300
+                                }
+
+                                val isBought = when (faction) {
+                                    Faction.AURELIAN_ORDER -> gameState.inventory.any { it.id == "item_aurelian_shield" }
+                                    Faction.EMBERPACT -> gameState.inventory.any { it.id == "item_overclocked_core" }
+                                    Faction.SILENT_VEIL -> gameState.inventory.any { it.id == "item_infiltration_dagger" }
+                                    else -> false
+                                }
+
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(if (points >= repThreshold) Color(faction.color).copy(alpha = 0.08f) else Color.DarkGray.copy(alpha = 0.1f))
+                                        .border(1.dp, if (points >= repThreshold) Color(faction.color) else Color.Gray, RoundedCornerShape(4.dp))
+                                        .padding(8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "FACTION ARMORY VENDOR:",
+                                            fontSize = 9.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = if (points >= repThreshold) Color(faction.color) else Color.Gray,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = itemToUnlock,
+                                            fontSize = 12.sp,
+                                            color = if (points >= repThreshold) QuantumLightText else Color.Gray,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = "Cost: $itemPrice Credits | Req: $repThreshold Rep",
+                                            fontSize = 10.sp,
+                                            color = QuantumGrayText
+                                        )
+                                    }
+
+                                    if (isBought) {
+                                        Text(
+                                            text = "ACQUIRED",
+                                            color = QuantumNeonGreen,
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    } else {
+                                        CyberButton(
+                                            onClick = {
+                                                viewModel.purchaseFactionItem(faction.name, itemToUnlock, itemPrice, repThreshold)
+                                            },
+                                            text = "PURCHASE",
+                                            color = Color(faction.color),
+                                            modifier = Modifier.width(90.dp),
+                                            enabled = points >= repThreshold && gameState.credits >= itemPrice
+                                        )
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(12.dp))
+                                HorizontalDivider(color = QuantumBorder)
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                Text(
+                                    text = "COMMISSION CONTRACTS",
+                                    color = QuantumGrayText,
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    CyberButton(
+                                        onClick = {
+                                            viewModel.completePOIMission("Solis Prime Sector")
+                                        },
+                                        text = "Tactical Intel",
+                                        color = Color(faction.color),
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    CyberButton(
+                                        onClick = {
+                                            viewModel.completePOIMission("Frontier Smuggling Node")
+                                        },
+                                        text = "Raw Materials",
+                                        color = Color(faction.color),
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // QUESTS BOARD TAB
+                    item {
+                        Text(
+                            text = "FACTION OPERATIONS & QUESTS",
+                            fontSize = 24.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = QuantumNeonBlue
                         )
-                        CyberButton(
-                            onClick = {
-                                viewModel.completePOIMission("Frontier Smuggling Node")
-                            },
-                            text = "Raw Materials",
-                            color = faction.color,
-                            modifier = Modifier.weight(1f)
+                        Text(
+                            text = "Engage in critical sector assignments. Make dialogue decisions that shape faction standings and unlock ultimate loyalty benefits.",
+                            color = QuantumGrayText,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
                         )
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    if (gameState.quests.isEmpty()) {
+                        item {
+                            Text(
+                                text = "No active faction operations available.",
+                                color = QuantumGrayText,
+                                fontSize = 14.sp,
+                                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                            )
+                        }
+                    } else {
+                        items(gameState.quests) { quest ->
+                            CyberCard(
+                                borderColor = if (quest.status == "COMPLETED") QuantumNeonGreen 
+                                               else if (quest.status == "ACTIVE") QuantumNeonBlue 
+                                               else Color.Gray
+                            ) {
+                                Column(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = quest.title.uppercase(),
+                                                fontSize = 16.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (quest.status == "COMPLETED") QuantumNeonGreen 
+                                                        else if (quest.status == "ACTIVE") QuantumNeonBlue 
+                                                        else QuantumLightText
+                                            )
+                                            Text(
+                                                text = "Giver: ${quest.giverName} | Faction: ${quest.faction}".uppercase(),
+                                                fontSize = 10.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = QuantumGrayText
+                                            )
+                                        }
+
+                                        Text(
+                                            text = quest.status,
+                                            color = if (quest.status == "COMPLETED") QuantumNeonGreen 
+                                                    else if (quest.status == "ACTIVE") QuantumNeonBlue 
+                                                    else Color.Gray,
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier
+                                                .background((if (quest.status == "COMPLETED") QuantumNeonGreen else if (quest.status == "ACTIVE") QuantumNeonBlue else Color.Gray).copy(alpha = 0.1f))
+                                                .border(1.dp, if (quest.status == "COMPLETED") QuantumNeonGreen else if (quest.status == "ACTIVE") QuantumNeonBlue else Color.Gray, RoundedCornerShape(3.dp))
+                                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text(
+                                        text = quest.description,
+                                        fontSize = 13.sp,
+                                        color = QuantumLightText.copy(alpha = 0.9f),
+                                        lineHeight = 17.sp
+                                    )
+
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = "Objective: ${quest.objectiveDesc}",
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = QuantumNeonOrange
+                                    )
+
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Rewards: +${quest.rewardCredits} Credits, +${quest.rewardNanites} Nanites, +${quest.rewardXp} XP, +${quest.rewardReputationPoints} Rep",
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = QuantumNeonGreen
+                                    )
+
+                                    Spacer(modifier = Modifier.height(12.dp))
+
+                                    when (quest.status) {
+                                        "AVAILABLE" -> {
+                                            CyberButton(
+                                                onClick = { viewModel.acceptQuest(quest.id) },
+                                                text = "ACCEPT QUEST",
+                                                color = QuantumNeonBlue,
+                                                modifier = Modifier.fillMaxWidth()
+                                            )
+                                        }
+                                        "ACTIVE" -> {
+                                            Column(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .background(QuantumDarkBg.copy(alpha = 0.6f))
+                                                    .border(1.dp, QuantumNeonBlue, RoundedCornerShape(4.dp))
+                                                    .padding(10.dp)
+                                            ) {
+                                                Text(
+                                                    text = "BRANCHING DIALOGUE TRANSMISSION:",
+                                                    fontSize = 10.sp,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    color = QuantumNeonBlue,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                                
+                                                val dialogText = when (quest.id) {
+                                                    "q_resonance_rift" -> "The coordinate grid is decaying. We salvaged a core data module from the Aurelian Archive. If we upload it to the Enlighteners, they will stabilize the region under severe monitoring. Nix wants us to leak it so the Technopunks can run freely. What is your call?"
+                                                    "q_scrapyard_jam" -> "The Enlighteners have set up a surveillance pylon that jams our scrap mining signals. We need to disable it. We can surge the grid to fry their systems, disable it safely and alert the guards, or reprogram it to siphon local transaction credits. What is your choice?"
+                                                    "q_nanite_epidemic" -> "The Frostveil Outpost is hit by a subatomic nanite mutation. I have synthesized a vaccine, but resources are limited. We can distribute it freely to everyone, sell the rights exclusively to the Ironward Megafactory, or inject ourselves with its unstable Voidium elements to boost our own power. What should we do?"
+                                                    "q_recruit_drox" -> "You want me to join your squad? Look, kid, I'm under contract with the Ironward Megafactory, and they hold my debt. You can pay my 300 credits debt, beat me in a biomechanical arm-wrestle if you think you're strong enough, or use those stolen Enlightener blueprints to black-market threaten my brokers. Make your move."
+                                                    else -> "Speak with the representative to determine the next operational route."
+                                                }
+
+                                                Spacer(modifier = Modifier.height(4.dp))
+                                                Text(
+                                                    text = "\"$dialogText\"",
+                                                    fontSize = 12.sp,
+                                                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                                                    color = QuantumLightText,
+                                                    lineHeight = 16.sp
+                                                )
+
+                                                Spacer(modifier = Modifier.height(10.dp))
+                                                Text(
+                                                    text = "MAKE YOUR CHOICE:",
+                                                    fontSize = 10.sp,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    color = QuantumNeonOrange,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                                Spacer(modifier = Modifier.height(6.dp))
+
+                                                val choices = when (quest.id) {
+                                                    "q_resonance_rift" -> listOf(
+                                                        "Leak to Technopunks (+Nix, +Emberpact standing)",
+                                                        "Upload to Enlighteners (+Lyra, +Aurelian standing)",
+                                                        "Wipe Database (+Credits, +Silent Veil standing)"
+                                                    )
+                                                    "q_scrapyard_jam" -> listOf(
+                                                        "Surge Radars (+Nanites, +Emberpact standing)",
+                                                        "Warn Guards (+Credits, +Aurelian standing)",
+                                                        "Reprogram Terminal (+300 Credits, +Silent Veil)"
+                                                    )
+                                                    "q_nanite_epidemic" -> listOf(
+                                                        "Distribute Freely (+Elsi, +All Alignments)",
+                                                        "Sell to Ironward (+400 Credits, +Ironward Standing)",
+                                                        "Absorb Voidium Vaccine (+XP, Permanent Power)"
+                                                    )
+                                                    "q_recruit_drox" -> listOf(
+                                                        "Pay off Debt (-300 Credits, Drox joins!)",
+                                                        "Arm-Wrestle (Requires Lvl 2+, Drox joins!)",
+                                                        "Blackmail Brokers (Threaten, Drox joins!)"
+                                                    )
+                                                    else -> emptyList()
+                                                }
+
+                                                choices.forEachIndexed { index, choiceText ->
+                                                    val isEnabled = when {
+                                                        quest.id == "q_recruit_drox" && index == 0 -> gameState.credits >= 300
+                                                        quest.id == "q_recruit_drox" && index == 1 -> gameState.level >= 2
+                                                        else -> true
+                                                    }
+                                                    
+                                                    CyberButton(
+                                                        onClick = { viewModel.makeQuestChoice(quest.id, index) },
+                                                        text = choiceText,
+                                                        color = if (index == 0) QuantumNeonOrange else if (index == 1) QuantumNeonBlue else QuantumNeonPurple,
+                                                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                                        enabled = isEnabled
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        "COMPLETED" -> {
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .background(QuantumNeonGreen.copy(alpha = 0.1f))
+                                                    .border(1.dp, QuantumNeonGreen, RoundedCornerShape(4.dp))
+                                                    .padding(10.dp),
+                                                horizontalArrangement = Arrangement.Center,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = "✓ SECURE CONCORDANCE - REWARDS DISTRIBUTED",
+                                                    fontSize = 11.sp,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = QuantumNeonGreen
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3935,12 +6810,1091 @@ fun FactionsScreen(
     }
 }
 
+@Composable
+fun FactionDialogueMatrixView(
+    viewModel: GameViewModel,
+    gameState: GameState
+) {
+    // Define the diplomats and their matrices
+    val diplomats = remember {
+        listOf(
+            DialogueDiplomat(
+                faction = Faction.AURELIAN_ORDER,
+                diplomatName = "Inquisitor Veron",
+                avatar = "🕶️",
+                alignmentType = "Technopunk",
+                philosophy = "Spacetime monitoring, strict galactic order, surveillance.",
+                greetings = mapOf(
+                    ReputationTier.HATED to "REPUTATION SEC-FAIL. Rebel element detected. Relinquish all illegally modified chronal data before we initiate immediate purification.",
+                    ReputationTier.HOSTILE to "Your coordinates are erratic. You carry the stench of frontier raiders. Do not attempt to breach Aurelian Prime core security.",
+                    ReputationTier.NEUTRAL to "Greetings, traveler. I am Inquisitor Veron. We monitor the spacetime lines for the glory of the Solis Core. Speak quickly.",
+                    ReputationTier.FAVORABLE to "Clearance authorized, Sentinel. Your actions have proven that you value order over chaos. The Aurelian vaults are open to you.",
+                    ReputationTier.REVERED to "All hail the Chrono Architect! The Solis Core sings in absolute resonance with your genetic imprint. Command us."
+                ),
+                choices = listOf(
+                    DialogueChoice(
+                        queryText = "Submit local system encryption codes to the Core.",
+                        reqTier = ReputationTier.NEUTRAL,
+                        effects = mapOf(
+                            Faction.AURELIAN_ORDER to 60,
+                            Faction.IRONWARD to 30,
+                            Faction.EMBERPACT to -50
+                        ),
+                        responseText = "Coordinates integrated. Sector security has improved by 4.2%. Excellent compliance, traveler."
+                    ),
+                    DialogueChoice(
+                        queryText = "Propose an anti-raider defense treaty with Ironward.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.AURELIAN_ORDER to 100,
+                            Faction.IRONWARD to 80,
+                            Faction.EMBERPACT to -80,
+                            Faction.VOID_SEEKERS to -40
+                        ),
+                        responseText = "A wise synthesis. The technopunk threat requires a concentrated biomechanical shield. The treaty is signed."
+                    ),
+                    DialogueChoice(
+                        queryText = "Demand access to the Forbidden Chrono Archives.",
+                        reqTier = ReputationTier.REVERED,
+                        effects = mapOf(
+                            Faction.AURELIAN_ORDER to 150,
+                            Faction.SILENT_VEIL to -100,
+                            Faction.VOID_SEEKERS to -50
+                        ),
+                        responseText = "The absolute truth of the 2084 Original Sin is yours to witness. See how the Quantum Babies' code was written."
+                    ),
+                    DialogueChoice(
+                        queryText = "Mock their technomystic obsession with authority.",
+                        reqTier = ReputationTier.HATED,
+                        effects = mapOf(
+                            Faction.AURELIAN_ORDER to -120,
+                            Faction.EMBERPACT to 100,
+                            Faction.SILENT_VEIL to 40
+                        ),
+                        responseText = "Insolent flesh. Order is the only shield preventing the universe from dissolving into the violet gravity ocean."
+                    )
+                )
+            ),
+            DialogueDiplomat(
+                faction = Faction.EMBERPACT,
+                diplomatName = "Warlord Korr",
+                avatar = "🦾",
+                alignmentType = "Enlightener",
+                philosophy = "Frontier mining independence, mech weapon tuning, freedom.",
+                greetings = mapOf(
+                    ReputationTier.HATED to "Aurelian bootlicker. You've sold out the frontier to those cyber-priests. Drox, grease up the scrap shredder!",
+                    ReputationTier.HOSTILE to "Watch your back, metal-face. The Emberpact doesn't tolerate spies or tax-collectors. One wrong step and you're salvage.",
+                    ReputationTier.NEUTRAL to "I'm Korr. We mine the scraps, we tune the hyper-coils, and we survive. You got steel in your spine, or are you just hollow?",
+                    ReputationTier.FAVORABLE to "Haha! I like you, traveler! That stunt you pulled against the Aurelian security patrol was legendary. Grab some fuel!",
+                    ReputationTier.REVERED to "The Free Frontier savior! You've broken the corporate stranglehold. Every mining clan in the Wastes carries your sigil!"
+                ),
+                choices = listOf(
+                    DialogueChoice(
+                        queryText = "Donate salvaged heavy weapon designs to the clans.",
+                        reqTier = ReputationTier.NEUTRAL,
+                        effects = mapOf(
+                            Faction.EMBERPACT to 70,
+                            Faction.SILENT_VEIL to -30,
+                            Faction.IRONWARD to -50
+                        ),
+                        responseText = "Now this is real firepower! Our plasma cannons will rip right through Aurelian shields. Good trading!"
+                    ),
+                    DialogueChoice(
+                        queryText = "Negotiate a cease-fire with the Ironward military.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.EMBERPACT to -80,
+                            Faction.IRONWARD to 120,
+                            Faction.AURELIAN_ORDER to 50
+                        ),
+                        responseText = "A cease-fire? You expect us to trust corporate suits? Fine... but if they move one drone into our scrap-yards, it's war."
+                    ),
+                    DialogueChoice(
+                        queryText = "Siphon corporate power grids to fuel frontier slums.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.EMBERPACT to 100,
+                            Faction.AURELIAN_ORDER to -120,
+                            Faction.IRONWARD to -80
+                        ),
+                        responseText = "Hahaha! The cyber-priests are blacking out! The slums have power, and our hyper-coils are fully charged. Brilliant!"
+                    ),
+                    DialogueChoice(
+                        queryText = "Accuse him of being a reckless warmonger.",
+                        reqTier = ReputationTier.HATED,
+                        effects = mapOf(
+                            Faction.EMBERPACT to -100,
+                            Faction.IRONWARD to 60,
+                            Faction.AURELIAN_ORDER to 40
+                        ),
+                        responseText = "Reckless? We are survivors, kid! While you crawl in corporate towers, we bleed for every nanite we harvest."
+                    )
+                )
+            ),
+            DialogueDiplomat(
+                faction = Faction.VOID_SEEKERS,
+                diplomatName = "Oracle Shae",
+                avatar = "🔮",
+                alignmentType = "Enlightener",
+                philosophy = "Dark matter harmonics, spacetime rifts, dimension folding.",
+                greetings = mapOf(
+                    ReputationTier.HATED to "You have severed your thread. The dark-matter rifts recoil from your touch. Go back to your collapsing physical prisons.",
+                    ReputationTier.HOSTILE to "We feel a cold void in your heart. You prioritize cold titanium over the deep wisdom of the gravity ocean. Turn back.",
+                    ReputationTier.NEUTRAL to "The timelines converge... I am Shae. I hear the echoes of the Quantum Babies floating in the violet sea. What seek you?",
+                    ReputationTier.FAVORABLE to "Traveler, your frequency is aligned with the aether. The rift-shattered sectors guide your path. Speak, the cosmos listens.",
+                    ReputationTier.REVERED to "The Void Transcendent! You have united the parallel coordinates. Your soul is woven directly into the fabric of the Origin."
+                ),
+                choices = listOf(
+                    DialogueChoice(
+                        queryText = "Perform a shared dark-matter frequency meditation.",
+                        reqTier = ReputationTier.NEUTRAL,
+                        effects = mapOf(
+                            Faction.VOID_SEEKERS to 80,
+                            Faction.SILENT_VEIL to 20,
+                            Faction.AURELIAN_ORDER to -50
+                        ),
+                        responseText = "Your neural pathways are glowing... I see the birth of the timeline splits in 2084. You are closer to the Quantum origin."
+                    ),
+                    DialogueChoice(
+                        queryText = "Trade rift coordinate files for forbidden void magic.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.VOID_SEEKERS to 120,
+                            Faction.AURELIAN_ORDER to -80,
+                            Faction.IRONWARD to -60
+                        ),
+                        responseText = "The dark matter whispers its secrets. Take this void frequency. It will shield you against the collapsing gravity pockets."
+                    ),
+                    DialogueChoice(
+                        queryText = "Offer to seal the volatile temporal rift in Nyx Expanse.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.VOID_SEEKERS to 100,
+                            Faction.AURELIAN_ORDER to 80,
+                            Faction.EMBERPACT to -60
+                        ),
+                        responseText = "The dimensional wound is bandaged. Spacetime stabilizes, though the phantom babies cry for their lost cradle."
+                    ),
+                    DialogueChoice(
+                        queryText = "Dismiss her cosmic revelations as superstitious nonsense.",
+                        reqTier = ReputationTier.HATED,
+                        effects = mapOf(
+                            Faction.VOID_SEEKERS to -120,
+                            Faction.IRONWARD to 80,
+                            Faction.SILENT_VEIL to 40
+                        ),
+                        responseText = "You are blind to the ocean you swim in. When your cybernetics rust and decay, the void will still remain."
+                    )
+                )
+            ),
+            DialogueDiplomat(
+                faction = Faction.IRONWARD,
+                diplomatName = "Commander Vance",
+                avatar = "🛡️",
+                alignmentType = "Technopunk",
+                philosophy = "Automated defenses, robotic engineering, heavy physical security.",
+                greetings = mapOf(
+                    ReputationTier.HATED to "Infiltrator. You are flagged as a high-threat saboteur. Automated sentry turrets are locked on your core. Leave.",
+                    ReputationTier.HOSTILE to "You've been associating with frontier raiders and anarchists. State your business before we process you for labor duty.",
+                    ReputationTier.NEUTRAL to "Commander Vance, Ironward Defense. We secure the industrial sectors, protect trade flows, and build the future. Speak up.",
+                    ReputationTier.FAVORABLE to "Excellent report, officer. Your tactical support has kept the industrial trade lines clean. Proceed to the armory.",
+                    ReputationTier.REVERED to "Supreme Commander! The Ironward robotic legions are fully synchronized under your authority. Sector security is absolute."
+                ),
+                choices = listOf(
+                    DialogueChoice(
+                        queryText = "Coordinate joint anti-espionage sweeps with Silent Veil.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.IRONWARD to 80,
+                            Faction.SILENT_VEIL to 80,
+                            Faction.EMBERPACT to -60
+                        ),
+                        responseText = "Tactical sweep complete. Silent Veil spycraft combined with Ironward military power has secured the server corridors."
+                    ),
+                    DialogueChoice(
+                        queryText = "Fund heavy robotic fortification grids in the sectors.",
+                        reqTier = ReputationTier.NEUTRAL,
+                        effects = mapOf(
+                            Faction.IRONWARD to 100,
+                            Faction.AURELIAN_ORDER to 50,
+                            Faction.EMBERPACT to -100
+                        ),
+                        responseText = "Credits transferred. Battle turrets are online. Let those mutant frontier raiders try to cross our borders now.",
+                        creditCost = 200
+                    ),
+                    DialogueChoice(
+                        queryText = "Decommission illegal corporate heavy weapon factories.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.IRONWARD to 120,
+                            Faction.EMBERPACT to 80,
+                            Faction.AURELIAN_ORDER to -120
+                        ),
+                        responseText = "Reactor core shut down. Industrial emissions are clean. Emberpact clans and Ironward unions both benefit from this peace."
+                    ),
+                    DialogueChoice(
+                        queryText = "Refuse to comply with military checkpoints.",
+                        reqTier = ReputationTier.HATED,
+                        effects = mapOf(
+                            Faction.IRONWARD to -120,
+                            Faction.EMBERPACT to 80,
+                            Faction.SILENT_VEIL to 50
+                        ),
+                        responseText = "Non-compliance is a class-3 civil offense. Expect interceptor drones in your next sector navigation warp."
+                    )
+                )
+            ),
+            DialogueDiplomat(
+                faction = Faction.SILENT_VEIL,
+                diplomatName = "Agent Lilith",
+                avatar = "🕷️",
+                alignmentType = "Shadow",
+                philosophy = "Espionage, bio-chem trafficking, secret trade, neutrality.",
+                greetings = mapOf(
+                    ReputationTier.HATED to "You talk too much, traveler. We've sold your coordinates to five different syndicate bounty hunters. Run.",
+                    ReputationTier.HOSTILE to "The shadows are watching you. You walk around with too much corporate light. We don't deal with loud targets.",
+                    ReputationTier.NEUTRAL to "Ah... a new client. I am Lilith. We deal in secrets, bio-chem vaccines, and quiet transactions. What is your budget?",
+                    ReputationTier.FAVORABLE to "Welcome back, partner. Our black market trades are flourishing thanks to your... discretion. Need anything illegal?",
+                    ReputationTier.REVERED to "The Shadow King! You control the flow of all sub-sector data networks. Not a single nanite moves without your permission."
+                ),
+                choices = listOf(
+                    DialogueChoice(
+                        queryText = "Sell stolen corporate research blueprints to the black market.",
+                        reqTier = ReputationTier.NEUTRAL,
+                        effects = mapOf(
+                            Faction.SILENT_VEIL to 70,
+                            Faction.AURELIAN_ORDER to -80,
+                            Faction.IRONWARD to -50
+                        ),
+                        responseText = "Ooh, highly encrypted bio-genetics. The black market will pay a fortune for this. Here are your credits, partner.",
+                        creditReward = 150
+                    ),
+                    DialogueChoice(
+                        queryText = "Establish an underground spy network in the sector.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.SILENT_VEIL to 100,
+                            Faction.EMBERPACT to 50,
+                            Faction.AURELIAN_ORDER to -100
+                        ),
+                        responseText = "Whisper networks are active. Every corporate meeting and raider plan is siphoned straight to our databank. Beautiful."
+                    ),
+                    DialogueChoice(
+                        queryText = "Assassinate a rogue cyber-assassin threatening her.",
+                        reqTier = ReputationTier.FAVORABLE,
+                        effects = mapOf(
+                            Faction.SILENT_VEIL to 120,
+                            Faction.IRONWARD to 60,
+                            Faction.VOID_SEEKERS to -40
+                        ),
+                        responseText = "Target neutralized. You handle a blade with exquisite precision, traveler. My gratitude is... immeasurable."
+                    ),
+                    DialogueChoice(
+                        queryText = "Threaten to expose their black-market smuggling routes.",
+                        reqTier = ReputationTier.HATED,
+                        effects = mapOf(
+                            Faction.SILENT_VEIL to -150,
+                            Faction.AURELIAN_ORDER to 80,
+                            Faction.IRONWARD to 50
+                        ),
+                        responseText = "Expose us? Try it, traveler. You will find that your life support controls can be toggled off very quietly."
+                    )
+                )
+            )
+        )
+    }
+
+    var selectedDiplomatIndex by remember { mutableStateOf(0) }
+    val currentDiplomat = diplomats[selectedDiplomatIndex]
+    
+    var activeChoiceQuery by remember { mutableStateOf("") }
+    var activeResponseText by remember { mutableStateOf("") }
+    
+    val currentRepPoints = gameState.factionReputations[currentDiplomat.faction] ?: 0
+    val currentTier = when {
+        currentRepPoints <= -500 -> ReputationTier.HATED
+        currentRepPoints <= -100 -> ReputationTier.HOSTILE
+        currentRepPoints < 500 -> ReputationTier.NEUTRAL
+        currentRepPoints < 1000 -> ReputationTier.FAVORABLE
+        else -> ReputationTier.REVERED
+    }
+
+    val currentVoiceText = currentDiplomat.greetings[currentTier] ?: ""
+
+    val aurelianRep = gameState.factionReputations[Faction.AURELIAN_ORDER] ?: 0
+    val ironwardRep = gameState.factionReputations[Faction.IRONWARD] ?: 0
+    val emberpactRep = gameState.factionReputations[Faction.EMBERPACT] ?: 0
+    val voidRep = gameState.factionReputations[Faction.VOID_SEEKERS] ?: 0
+    val veilRep = gameState.factionReputations[Faction.SILENT_VEIL] ?: 0
+
+    val technopunkScore = aurelianRep + ironwardRep
+    val enlightenerScore = emberpactRep + voidRep
+    val outlawScore = veilRep
+
+    val dynamicTitle = when {
+        technopunkScore > enlightenerScore + 300 && technopunkScore > outlawScore -> "CYBERNETIC SYSTEM ENFORCER"
+        enlightenerScore > technopunkScore + 300 && enlightenerScore > outlawScore -> "BIOMECHANICAL RIFT PROPHET"
+        outlawScore > technopunkScore && outlawScore > enlightenerScore -> "SHADOW BLOCKCHAIN BROKER"
+        else -> "QUANTUM DIPLOMATIC SENTINEL"
+    }
+    
+    val dynamicTitleColor = when {
+        technopunkScore > enlightenerScore + 300 && technopunkScore > outlawScore -> QuantumNeonBlue
+        enlightenerScore > technopunkScore + 300 && enlightenerScore > outlawScore -> QuantumNeonOrange
+        outlawScore > technopunkScore && outlawScore > enlightenerScore -> QuantumNeonRed
+        else -> QuantumNeonPurple
+    }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            Text(
+                text = "⚡ FACTION DIPLOMATIC REPRESENTATIVES",
+                fontSize = 18.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                color = QuantumNeonPurple
+            )
+            Text(
+                text = "Negotiate alliances directly with sector leaders. Dialogue decisions carry ripple effects across rival networks.",
+                color = QuantumGrayText,
+                fontSize = 12.sp,
+                lineHeight = 16.sp
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+
+        item {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                diplomats.forEachIndexed { idx, dip ->
+                    val isSelected = idx == selectedDiplomatIndex
+                    val dipRep = gameState.factionReputations[dip.faction] ?: 0
+                    val dipColor = Color(dip.faction.color)
+
+                    Box(
+                        modifier = Modifier
+                            .width(135.dp)
+                            .background(
+                                if (isSelected) dipColor.copy(alpha = 0.15f) else QuantumDarkBg,
+                                RoundedCornerShape(8.dp)
+                            )
+                            .border(
+                                width = if (isSelected) 2.dp else 1.dp,
+                                color = if (isSelected) dipColor else QuantumBorder,
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .clickable {
+                                selectedDiplomatIndex = idx
+                                activeChoiceQuery = ""
+                                activeResponseText = ""
+                            }
+                            .padding(10.dp)
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = dip.avatar,
+                                fontSize = 32.sp,
+                                modifier = Modifier.padding(bottom = 6.dp)
+                            )
+                            Text(
+                                text = dip.diplomatName,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSelected) Color.White else QuantumLightText,
+                                maxLines = 1,
+                                textAlign = TextAlign.Center
+                            )
+                            Text(
+                                text = dip.faction.displayName.uppercase(),
+                                fontSize = 8.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = dipColor,
+                                maxLines = 1,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "${if (dipRep >= 0) "+" else ""}$dipRep FP",
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = if (dipRep >= 500) QuantumNeonGreen else if (dipRep < 0) QuantumNeonRed else Color.Gray,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            val factionColor = Color(currentDiplomat.faction.color)
+            CyberCard(borderColor = factionColor) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(factionColor.copy(alpha = 0.1f))
+                            .border(1.dp, factionColor.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .background(QuantumNeonGreen, RoundedCornerShape(3.dp))
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "COSMIC-COMMS CHANNEL: SECURE",
+                                color = Color.White,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Text(
+                            text = "TIER: ${currentTier.title.uppercase()}",
+                            color = Color(currentTier.color),
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    val diplomatColor = Color(currentDiplomat.faction.color)
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .width(70.dp)
+                                .background(Color.Black.copy(alpha = 0.4f))
+                                .border(1.dp, diplomatColor.copy(alpha = 0.3f), RoundedCornerShape(6.dp))
+                                .padding(8.dp)
+                        ) {
+                            Text(
+                                text = currentDiplomat.avatar,
+                                fontSize = 40.sp,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                            Text(
+                                text = currentDiplomat.alignmentType.uppercase(),
+                                fontSize = 8.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = diplomatColor,
+                                modifier = Modifier
+                                    .background(diplomatColor.copy(alpha = 0.15f))
+                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 80.dp)
+                                .background(Color.Black.copy(alpha = 0.2f))
+                                .border(1.dp, QuantumBorder, RoundedCornerShape(6.dp))
+                                .padding(8.dp)
+                        ) {
+                            Text(
+                                text = currentDiplomat.diplomatName.uppercase() + " says:",
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = diplomatColor,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "\"$currentVoiceText\"",
+                                fontSize = 12.sp,
+                                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                                color = QuantumLightText,
+                                lineHeight = 16.sp
+                            )
+                        }
+                    }
+
+                    if (activeResponseText.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(QuantumNeonGreen.copy(alpha = 0.05f))
+                                .border(1.dp, QuantumNeonGreen.copy(alpha = 0.3f), RoundedCornerShape(6.dp))
+                                .padding(10.dp)
+                        ) {
+                            Column {
+                                Text(
+                                    text = "YOUR TRANSMISSION: \"$activeChoiceQuery\"",
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = QuantumNeonPurple,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = "RESPONSE: \"$activeResponseText\"",
+                                    fontSize = 12.sp,
+                                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                                    color = QuantumLightText,
+                                    lineHeight = 16.sp
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = "✓ TRANS-MATRIX ALIGNMENT MODIFIED STATUS SUCCESSFUL",
+                                    fontSize = 8.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = QuantumNeonGreen,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider(color = QuantumBorder)
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Text(
+                        text = "MATRIX QUERIES (SELECT TO INTERACT):",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = QuantumNeonOrange,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 6.dp)
+                    )
+
+                    currentDiplomat.choices.forEachIndexed { index, choice ->
+                        val playerRepPoints = gameState.factionReputations[currentDiplomat.faction] ?: 0
+                        val hasSufficientRep = playerRepPoints >= choice.reqTier.threshold
+                        val hasSufficientCredits = choice.creditCost == 0 || gameState.credits >= choice.creditCost
+                        val isChoiceEnabled = hasSufficientRep && hasSufficientCredits
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .background(
+                                    if (isChoiceEnabled) Color.Black.copy(alpha = 0.3f) 
+                                    else Color.DarkGray.copy(alpha = 0.1f)
+                                )
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isChoiceEnabled) Color(currentDiplomat.faction.color).copy(alpha = 0.4f) else Color.Gray.copy(alpha = 0.2f),
+                                    shape = RoundedCornerShape(6.dp)
+                                )
+                                .clickable(enabled = isChoiceEnabled) {
+                                    activeChoiceQuery = choice.queryText
+                                    activeResponseText = choice.responseText
+                                    
+                                    if (choice.creditCost > 0) {
+                                        viewModel.spendCreditsDirectly(choice.creditCost)
+                                    }
+                                    if (choice.creditReward > 0) {
+                                        viewModel.awardCreditsDirectly(choice.creditReward)
+                                    }
+                                    
+                                    val logText = "${currentDiplomat.diplomatName}: ${choice.queryText.take(30)}... Standing updated!"
+                                    viewModel.modifyFactionReputations(choice.effects, logText)
+                                }
+                                .padding(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = choice.queryText,
+                                        fontSize = 12.sp,
+                                        color = if (isChoiceEnabled) Color.White else Color.Gray,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        choice.effects.forEach { (faction, amount) ->
+                                            Text(
+                                                text = "${faction.displayName.take(10)}: ${if (amount >= 0) "+" else ""}$amount",
+                                                fontSize = 9.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = if (amount >= 0) QuantumNeonGreen else QuantumNeonRed
+                                            )
+                                        }
+                                        if (choice.creditReward > 0) {
+                                            Text(
+                                                text = "+${choice.creditReward} Credits",
+                                                fontSize = 9.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = QuantumNeonGreen
+                                            )
+                                        }
+                                        if (choice.creditCost > 0) {
+                                            Text(
+                                                text = "-${choice.creditCost} Credits",
+                                                fontSize = 9.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = QuantumNeonRed
+                                            )
+                                        }
+                                    }
+                                }
+
+                                if (!hasSufficientRep) {
+                                    Text(
+                                        text = "🔒 REQ: ${choice.reqTier.title.uppercase()}",
+                                        color = QuantumNeonRed,
+                                        fontSize = 9.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier
+                                            .background(QuantumNeonRed.copy(alpha = 0.15f))
+                                            .border(1.dp, QuantumNeonRed, RoundedCornerShape(3.dp))
+                                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                                    )
+                                } else if (!hasSufficientCredits) {
+                                    Text(
+                                        text = "🔒 LACK CREDITS",
+                                        color = QuantumNeonRed,
+                                        fontSize = 9.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier
+                                            .background(QuantumNeonRed.copy(alpha = 0.15f))
+                                            .border(1.dp, QuantumNeonRed, RoundedCornerShape(3.dp))
+                                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                                    )
+                                } else {
+                                    Text(
+                                        text = "➤",
+                                        color = Color(currentDiplomat.faction.color),
+                                        fontSize = 14.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            CyberCard(borderColor = dynamicTitleColor) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp)
+                ) {
+                    Text(
+                        text = "🌌 COSMIC ALLIANCE ALIGNMENT STATUS",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = dynamicTitleColor,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Calculated from your composite faction scores across the systems.",
+                        fontSize = 11.sp,
+                        color = QuantumGrayText
+                    )
+                    
+                    Spacer(modifier = Modifier.height(10.dp))
+                    
+                    Text(
+                        text = "CURRENT STANDING: $dynamicTitle",
+                        color = dynamicTitleColor,
+                        fontSize = 13.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .background(dynamicTitleColor.copy(alpha = 0.1f))
+                            .border(1.dp, dynamicTitleColor, RoundedCornerShape(4.dp))
+                            .padding(6.dp)
+                            .fillMaxWidth(),
+                        textAlign = TextAlign.Center
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    CyberProgressBar(
+                        progress = ((technopunkScore + 2000) / 4000f).coerceIn(0f, 1f),
+                        label = "TECHNOPUNK SYNDICATE AXIS",
+                        valueText = "$technopunkScore FP",
+                        color = QuantumNeonBlue
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    CyberProgressBar(
+                        progress = ((enlightenerScore + 2000) / 4000f).coerceIn(0f, 1f),
+                        label = "ENLIGHTENER UNITY COALITION",
+                        valueText = "$enlightenerScore FP",
+                        color = QuantumNeonOrange
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    CyberProgressBar(
+                        progress = ((outlawScore + 1000) / 2000f).coerceIn(0f, 1f),
+                        label = "SHADOW BLOCKCHAIN LEVERAGE",
+                        valueText = "$outlawScore FP",
+                        color = QuantumNeonRed
+                    )
+                }
+            }
+        }
+    }
+}
+
+data class DialogueDiplomat(
+    val faction: Faction,
+    val diplomatName: String,
+    val avatar: String,
+    val alignmentType: String,
+    val philosophy: String,
+    val greetings: Map<ReputationTier, String>,
+    val choices: List<DialogueChoice>
+)
+
+data class DialogueChoice(
+    val queryText: String,
+    val reqTier: ReputationTier,
+    val effects: Map<Faction, Int>,
+    val responseText: String,
+    val creditReward: Int = 0,
+    val creditCost: Int = 0
+)
+
 // --- SCREEN 4: COMPANIONS ---
+
+data class CyberwareChip(
+    val name: String,
+    val hpBonus: Int = 0,
+    val mpBonus: Int = 0,
+    val atkBonus: Int = 0,
+    val defBonus: Int = 0,
+    val magBonus: Int = 0,
+    val spdBonus: Int = 0,
+    val lckBonus: Int = 0,
+    val desc: String = ""
+)
+
+fun parseGearToChip(gearName: String?): CyberwareChip {
+    if (gearName == null || gearName == "None" || gearName.isBlank()) {
+        return CyberwareChip("Empty Slot", desc = "Biomechanical socket is empty. Install custom chips to augment chassis stats.")
+    }
+    
+    if (gearName.contains("[Spliced]", ignoreCase = true) || gearName.contains("[SPLICED]")) {
+        var hp = 0
+        var mp = 0
+        var atk = 0
+        var def = 0
+        var mag = 0
+        var spd = 0
+        var lck = 0
+        
+        val statPattern = java.util.regex.Pattern.compile("\\+?(\\d+)\\s+(HP|MP|ATK|DEF|MAG|SPD|LCK)")
+        val matcher = statPattern.matcher(gearName)
+        while (matcher.find()) {
+            val valStr = matcher.group(1) ?: "0"
+            val typeStr = matcher.group(2) ?: ""
+            val value = valStr.toIntOrNull() ?: 0
+            when (typeStr.uppercase()) {
+                "HP" -> hp = value
+                "MP" -> mp = value
+                "ATK" -> atk = value
+                "DEF" -> def = value
+                "MAG" -> mag = value
+                "SPD" -> spd = value
+                "LCK" -> lck = value
+            }
+        }
+        val cleanName = gearName.substringBefore(" (").trim()
+        return CyberwareChip(
+            name = cleanName,
+            hpBonus = hp,
+            mpBonus = mp,
+            atkBonus = atk,
+            defBonus = def,
+            magBonus = mag,
+            spdBonus = spd,
+            lckBonus = lck,
+            desc = "Advanced dual-fused bio-mechanical cyber-chip."
+        )
+    }
+
+    return when (gearName) {
+        // Factory Weapons (Cranial Node)
+        "Alloy Core Sabot" -> CyberwareChip(gearName, atkBonus = 15, spdBonus = 5, desc = "Factory-issue cranial physical defense driver.")
+        "EMP Capacitor Gun" -> CyberwareChip(gearName, atkBonus = 10, magBonus = 10, desc = "Factory-issue magnetic electrical driver.")
+        "Welding Arc Spanner" -> CyberwareChip(gearName, atkBonus = 5, magBonus = 15, desc = "Precision cortex welding arc.")
+        "Monomolecular Sledge" -> CyberwareChip(gearName, atkBonus = 25, desc = "Super-dense impact mass driver.")
+        "Singularity Resonator" -> CyberwareChip(gearName, magBonus = 15, mpBonus = 10, desc = "Cerebral void vibration resonator.")
+        
+        // Factory Armor (Dermal Node)
+        "Quantum Plate" -> CyberwareChip(gearName, defBonus = 20, hpBonus = 40, desc = "Standard titanium-quantum shielding.")
+        "Nomad Cloak" -> CyberwareChip(gearName, defBonus = 10, hpBonus = 50, spdBonus = 5, desc = "Flexible nomadic atmospheric shielding.")
+        "Nano Fiber Uniform" -> CyberwareChip(gearName, defBonus = 15, hpBonus = 30, desc = "High-tensile protective suit.")
+        "Blast Shielding Plate" -> CyberwareChip(gearName, defBonus = 30, hpBonus = 60, desc = "Heavy-duty ballistic energy plating.")
+        "Amethyst Shroud" -> CyberwareChip(gearName, defBonus = 15, hpBonus = 40, mpBonus = 10, desc = "Void-touched stealth fabric.")
+        
+        // Factory Modules (Reactor Node)
+        "Threat Scanner" -> CyberwareChip(gearName, defBonus = 10, lckBonus = 5, desc = "Factory diagnostic sensor.")
+        "Recon Scan Chip" -> CyberwareChip(gearName, spdBonus = 5, lckBonus = 10, desc = "Perception scan transceiver.")
+        "Overclock Regulator" -> CyberwareChip(gearName, mpBonus = 15, magBonus = 10, desc = "Bio-reactor pressure regulator.")
+        "Taunt Beacon" -> CyberwareChip(gearName, hpBonus = 50, defBonus = 10, desc = "Core energy emitter frequency.")
+        "Void Keypad" -> CyberwareChip(gearName, mpBonus = 20, lckBonus = 10, desc = "Spatial interface matrix.")
+
+        // Base customizable chips (Cranial)
+        "Neural Processor V1" -> CyberwareChip(gearName, atkBonus = 15, magBonus = 10, desc = "Overclocks cortex response loops.")
+        "Tactical HUD Link" -> CyberwareChip(gearName, spdBonus = 15, lckBonus = 10, desc = "Overlays target lock vectors on retinas.")
+        "AI Co-Pilot Synapse" -> CyberwareChip(gearName, magBonus = 20, mpBonus = 10, desc = "Links cerebral cortex directly to drone autopilot.")
+
+        // Base customizable chips (Dermal)
+        "Titanium Carapace V1" -> CyberwareChip(gearName, defBonus = 25, desc = "Dense metallic plate infused with subdermal fibers.")
+        "Nanite Aegis Field" -> CyberwareChip(gearName, hpBonus = 50, defBonus = 15, desc = "Sheds energy impacts via active nanite layer.")
+        "Thermal Graphene Mesh" -> CyberwareChip(gearName, hpBonus = 40, mpBonus = 10, desc = "Regulates biomechanical thermal flow.")
+
+        // Base customizable chips (Actuators)
+        "Hydraulic Pistons V1" -> CyberwareChip(gearName, atkBonus = 20, hpBonus = 10, desc = "High-pressure fluid lines for brute impact force.")
+        "Tachyon Thruster Rails" -> CyberwareChip(gearName, spdBonus = 25, desc = "Magnetic propulsion vents mounted to skeletal frames.")
+        "Myomer Reflex Weave" -> CyberwareChip(gearName, spdBonus = 15, lckBonus = 15, desc = "Synthetic muscle fibers reacting at near lightspeed.")
+
+        // Base customizable chips (Reactor)
+        "Singularity Resonance Core" -> CyberwareChip(gearName, magBonus = 20, mpBonus = 15, desc = "Captures gravity wave fluctuations.")
+        "Nanite Battery Conduit" -> CyberwareChip(gearName, hpBonus = 60, mpBonus = 15, desc = "Backup cellular battery stack.")
+        "Void Spark Inverter" -> CyberwareChip(gearName, mpBonus = 30, lckBonus = 10, desc = "Extracts energy directly from parallel sub-sectors.")
+
+        else -> {
+            val statDesc = gearName.substringAfter("(").substringBefore(")")
+            CyberwareChip(gearName.substringBefore(" ("), desc = "Fitted module modifying: $statDesc")
+        }
+    }
+}
+
+fun calculateCompanionStats(companion: CompanionRecord): Map<String, Int> {
+    val level = companion.level
+    val baseHp = when (companion.name) {
+        "ATOM" -> 450 + level * 50
+        "LUMEN" -> 380 + level * 40
+        "NIA" -> 400 + level * 45
+        "REX" -> 600 + level * 65
+        "ECHO" -> 420 + level * 48
+        else -> 400 + level * 50
+    }
+    val baseMp = when (companion.name) {
+        "ATOM" -> 60 + level * 6
+        "LUMEN" -> 80 + level * 8
+        "NIA" -> 90 + level * 9
+        "REX" -> 40 + level * 4
+        "ECHO" -> 100 + level * 10
+        else -> 70 + level * 7
+    }
+    val baseAtk = when (companion.name) {
+        "ATOM" -> 45 + level * 5
+        "LUMEN" -> 35 + level * 4
+        "NIA" -> 25 + level * 3
+        "REX" -> 55 + level * 6
+        "ECHO" -> 30 + level * 4
+        else -> 35 + level * 5
+    }
+    val baseDef = when (companion.name) {
+        "ATOM" -> 25 + level * 3
+        "LUMEN" -> 20 + level * 2
+        "NIA" -> 30 + level * 3
+        "REX" -> 50 + level * 5
+        "ECHO" -> 20 + level * 2
+        else -> 25 + level * 3
+    }
+    val baseMag = when (companion.name) {
+        "ATOM" -> 30 + level * 3
+        "LUMEN" -> 45 + level * 5
+        "NIA" -> 40 + level * 4
+        "REX" -> 15 + level * 1
+        "ECHO" -> 50 + level * 6
+        else -> 30 + level * 4
+    }
+    val baseSpd = when (companion.name) {
+        "ATOM" -> 25 + level * 2
+        "LUMEN" -> 30 + level * 3
+        "NIA" -> 22 + level * 2
+        "REX" -> 15 + level * 1
+        "ECHO" -> 35 + level * 3
+        else -> 25 + level * 2
+    }
+    val baseLck = when (companion.name) {
+        "ATOM" -> 12 + level
+        "LUMEN" -> 15 + level
+        "NIA" -> 18 + level
+        "REX" -> 10 + level
+        "ECHO" -> 20 + level
+        else -> 12 + level
+    }
+
+    var extraHp = 0
+    var extraMp = 0
+    var extraAtk = 0
+    var extraDef = 0
+    var extraMag = 0
+    var extraSpd = 0
+    var extraLck = 0
+
+    val slots = listOf(companion.weaponEquipped ?: "None", companion.armorEquipped ?: "None", companion.accessoryEquipped ?: "None", companion.moduleEquipped ?: "None")
+    for (equipped in slots) {
+        if (equipped == "None" || equipped.isBlank()) continue
+        val gearChip = parseGearToChip(equipped)
+        extraHp += gearChip.hpBonus
+        extraMp += gearChip.mpBonus
+        extraAtk += gearChip.atkBonus
+        extraDef += gearChip.defBonus
+        extraMag += gearChip.magBonus
+        extraSpd += gearChip.spdBonus
+        extraLck += gearChip.lckBonus
+    }
+
+    return mapOf(
+        "HP" to (baseHp + extraHp),
+        "MP" to (baseMp + extraMp),
+        "ATK" to (baseAtk + extraAtk),
+        "DEF" to (baseDef + extraDef),
+        "MAG" to (baseMag + extraMag),
+        "SPD" to (baseSpd + extraSpd),
+        "LCK" to (baseLck + extraLck),
+        "baseHp" to baseHp, "extraHp" to extraHp,
+        "baseMp" to baseMp, "extraMp" to extraMp,
+        "baseAtk" to baseAtk, "extraAtk" to extraAtk,
+        "baseDef" to baseDef, "extraDef" to extraDef,
+        "baseMag" to baseMag, "extraMag" to extraMag,
+        "baseSpd" to baseSpd, "extraSpd" to extraSpd,
+        "baseLck" to baseLck, "extraLck" to extraLck
+    )
+}
+
+private fun getFusedName(nameA: String, nameB: String, slot: String): String {
+    val cleanA = nameA.replace(" V1", "").replace(" V2", "").replace(" V3", "").replace("[SPLICED]", "").trim()
+    val cleanB = nameB.replace(" V1", "").replace(" V2", "").replace(" V3", "").replace("[SPLICED]", "").trim()
+    
+    if (cleanA == cleanB) {
+        return "SUPERCHARGED $cleanA"
+    }
+    
+    if ((cleanA == "Neural Processor" && cleanB == "Tactical HUD Link") || (cleanB == "Neural Processor" && cleanA == "Tactical HUD Link")) {
+        return "CEREBRAL TARGETING HUBLINK"
+    }
+    if ((cleanA == "Neural Processor" && cleanB == "AI Co-Pilot Synapse") || (cleanB == "Neural Processor" && cleanA == "AI Co-Pilot Synapse")) {
+        return "SYNAPTIC CYBER-BRAIN"
+    }
+    if ((cleanA == "Tactical HUD Link" && cleanB == "AI Co-Pilot Synapse") || (cleanB == "Tactical HUD Link" && cleanA == "AI Co-Pilot Synapse")) {
+        return "PREDICTIVE TACTICAL CO-PILOT"
+    }
+    if ((cleanA == "Titanium Carapace" && cleanB == "Nanite Aegis Field") || (cleanB == "Titanium Carapace" && cleanA == "Nanite Aegis Field")) {
+        return "TITAN AEGIS SHIELDING"
+    }
+    if ((cleanA == "Titanium Carapace" && cleanB == "Thermal Graphene Mesh") || (cleanB == "Titanium Carapace" && cleanA == "Thermal Graphene Mesh")) {
+        return "GRAPHENE-THERMO ARMOR CHASSIS"
+    }
+    if ((cleanA == "Nanite Aegis Field" && cleanB == "Thermal Graphene Mesh") || (cleanB == "Nanite Aegis Field" && cleanA == "Thermal Graphene Mesh")) {
+        return "BIO-NANITE RESPONSIVE MESH"
+    }
+    if ((cleanA == "Hydraulic Pistons" && cleanB == "Tachyon Thruster Rails") || (cleanB == "Hydraulic Pistons" && cleanA == "Tachyon Thruster Rails")) {
+        return "MAGNETO-HYDRAULIC CRUSHER"
+    }
+    if ((cleanA == "Hydraulic Pistons" && cleanB == "Myomer Reflex Weave") || (cleanB == "Hydraulic Pistons" && cleanA == "Myomer Reflex Weave")) {
+        return "MYOMER HIGH-TORQUE THRUSTER"
+    }
+    if ((cleanA == "Tachyon Thruster Rails" && cleanB == "Myomer Reflex Weave") || (cleanB == "Tachyon Thruster Rails" && cleanA == "Myomer Reflex Weave")) {
+        return "KINETIC FLUX ELECTRA-THRUSTERS"
+    }
+    if ((cleanA == "Singularity Resonance Core" && cleanB == "Nanite Battery Conduit") || (cleanB == "Singularity Resonance Core" && cleanA == "Nanite Battery Conduit")) {
+        return "SINGULARITY NANITE REACTOR"
+    }
+    if ((cleanA == "Singularity Resonance Core" && cleanB == "Void Spark Inverter") || (cleanB == "Singularity Resonance Core" && cleanA == "Void Spark Inverter")) {
+        return "COSMIC INVERSION VOIDCORE"
+    }
+    if ((cleanA == "Nanite Battery Conduit" && cleanB == "Void Spark Inverter") || (cleanB == "Nanite Battery Conduit" && cleanA == "Void Spark Inverter")) {
+        return "VOID-INFUSED BIO-BATTERY"
+    }
+    
+    val prefix = cleanA.split(" ").firstOrNull() ?: "Quantum"
+    val suffix = cleanB.split(" ").lastOrNull() ?: "Processor"
+    return "${prefix.uppercase()}-${suffix.uppercase()} PROTO-CORE"
+}
+
+fun formatChipStats(chip: CyberwareChip): String {
+    val stats = mutableListOf<String>()
+    if (chip.hpBonus > 0) stats.add("+${chip.hpBonus} HP")
+    if (chip.mpBonus > 0) stats.add("+${chip.mpBonus} MP")
+    if (chip.atkBonus > 0) stats.add("+${chip.atkBonus} ATK")
+    if (chip.defBonus > 0) stats.add("+${chip.defBonus} DEF")
+    if (chip.magBonus > 0) stats.add("+${chip.magBonus} MAG")
+    if (chip.spdBonus > 0) stats.add("+${chip.spdBonus} SPD")
+    if (chip.lckBonus > 0) stats.add("+${chip.lckBonus} LCK")
+    return if (stats.isEmpty()) "No bonuses" else stats.joinToString(", ")
+}
 
 @Composable
 fun CompanionsScreen(
     viewModel: GameViewModel,
     gameState: GameState
+) {
+    var activeCompanionForCustomization by remember { mutableStateOf<CompanionRecord?>(null) }
+    
+    val currentCompanion = activeCompanionForCustomization?.let { cached ->
+        gameState.companions.find { it.name == cached.name }
+    }
+
+    if (currentCompanion != null) {
+        CompanionCyberwareGridScreen(
+            companion = currentCompanion,
+            gameState = gameState,
+            viewModel = viewModel,
+            onBack = { activeCompanionForCustomization = null }
+        )
+    } else {
+        CompanionLedgerScreen(
+            companions = gameState.companions,
+            credits = gameState.credits,
+            viewModel = viewModel,
+            onOpenCyberware = { companion ->
+                activeCompanionForCustomization = companion
+            }
+        )
+    }
+}
+
+@Composable
+fun CompanionLedgerScreen(
+    companions: List<CompanionRecord>,
+    credits: Int,
+    viewModel: GameViewModel,
+    onOpenCyberware: (CompanionRecord) -> Unit
 ) {
     LazyColumn(
         modifier = Modifier
@@ -3957,7 +7911,7 @@ fun CompanionsScreen(
                 color = QuantumNeonGreen
             )
             Text(
-                text = "Coordinate with elite units. Strengthen companion bonds through data gifts to unlock powerful active combat modifiers.",
+                text = "Coordinate with elite tactical units. Open their customizable bio-mechanical cyberware grids to slice together augmented chip modifications and optimize sector combat ratings.",
                 color = QuantumGrayText,
                 fontSize = 13.sp,
                 lineHeight = 18.sp
@@ -3965,12 +7919,27 @@ fun CompanionsScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        items(gameState.companions) { companion ->
+        items(companions) { companion ->
             val bondTier = when {
                 companion.bondPoints < 30 -> "STRANGER"
                 companion.bondPoints < 60 -> "ACQUAINTED"
                 companion.bondPoints < 95 -> "TRUSTED COMPANION"
-                else -> "QUANTUM BOUND"
+                else -> "QUANTUM BOUND (ROMANCED)"
+            }
+
+            val milestonePerk = when {
+                companion.bondPoints < 30 -> "No active milestones. Gain trust to synchronize core neural modules."
+                companion.bondPoints < 60 -> "TRUST PERK: +5% Critical Strike Rate."
+                companion.bondPoints < 95 -> "FRIENDSHIP PERK: +15% Nanite Loot Collection Rates."
+                else -> "ROMANCE PERK: Ultimate entangle. -25% MP Cost for all active Quantum Skills!"
+            }
+
+            val dynamicDialogue = when {
+                !companion.isRecruited -> "Signal offline. Connect beacon terminal."
+                companion.bondPoints < 30 -> "System link verified. Monitoring quantum wave emissions... Let us proceed, Director."
+                companion.bondPoints < 60 -> "You've been treating me well, Director. My subroutines are beginning to align with your tactical maneuvers!"
+                companion.bondPoints < 95 -> "It is an honor to serve alongside you, my friend. I've recalculated our survival rates, and they are incredibly favorable with you leading us."
+                else -> "Our quantum states are perfectly entangled. No force in the sector can tear us apart now. I am forever yours, and will protect you to my last nanite."
             }
 
             CyberCard(borderColor = if (companion.isRecruited) QuantumNeonGreen else QuantumBorder) {
@@ -3997,13 +7966,30 @@ fun CompanionsScreen(
                     Spacer(modifier = Modifier.width(14.dp))
 
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = companion.name.uppercase(),
-                            fontSize = 17.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            color = if (companion.isRecruited) QuantumNeonGreen else Color.Gray
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = companion.name.uppercase(),
+                                fontSize = 17.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = if (companion.isRecruited) QuantumNeonGreen else Color.Gray
+                            )
+                            if (companion.isRecruited) {
+                                Text(
+                                    text = "ACTIVE",
+                                    color = QuantumNeonGreen,
+                                    fontSize = 9.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier
+                                        .background(QuantumNeonGreen.copy(alpha = 0.1f))
+                                        .border(1.dp, QuantumNeonGreen, RoundedCornerShape(2.dp))
+                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
                         Text(
                             text = "Specialty: ${companion.role} | Alignment: ${companion.faction}".uppercase(),
                             color = QuantumGrayText,
@@ -4011,13 +7997,16 @@ fun CompanionsScreen(
                             fontFamily = FontFamily.Monospace
                         )
 
+                        Spacer(modifier = Modifier.height(4.dp))
+
                         if (companion.isRecruited) {
                             Text(
-                                text = "Dialogue: \"I am ready to follow you, Director!\"",
+                                text = "Dialogue: \"$dynamicDialogue\"",
                                 fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
-                                color = QuantumLightText.copy(alpha = 0.8f),
+                                color = QuantumLightText.copy(alpha = 0.85f),
                                 fontSize = 12.sp,
-                                modifier = Modifier.padding(vertical = 4.dp)
+                                modifier = Modifier.padding(vertical = 4.dp),
+                                lineHeight = 16.sp
                             )
                             Text(
                                 text = "Active Ability: ${companion.activeSkill}",
@@ -4032,40 +8021,70 @@ fun CompanionsScreen(
                                 fontSize = 11.sp,
                                 lineHeight = 15.sp
                             )
-                            Spacer(modifier = Modifier.height(8.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = milestonePerk,
+                                color = if (companion.bondPoints >= 95) QuantumNeonPurple else if (companion.bondPoints >= 60) QuantumNeonOrange else QuantumGrayText,
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
                             CyberProgressBar(
                                 progress = companion.bondPoints / 100f,
                                 label = "BOND AFFINITY: $bondTier",
                                 valueText = "${companion.bondPoints}%",
-                                color = QuantumNeonGreen
+                                color = if (companion.bondPoints >= 95) QuantumNeonPurple else if (companion.bondPoints >= 60) QuantumNeonOrange else QuantumNeonGreen
                             )
                         } else {
+                            val lockText = if (companion.name == "Drox") {
+                                "Status: Contract locked by Ironward Megafactory. Go to the Factions -> Quests Ledger tab and clear Drox's recruitment quest!"
+                            } else {
+                                "Status: Locked in deep parallel space sector. Requires signal beacon or local faction coordinates."
+                            }
                             Text(
-                                text = "Status: Locked in deep parallel space sector. Requires signal beacon.",
+                                text = lockText,
                                 color = QuantumNeonRed,
                                 fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace
+                                fontFamily = FontFamily.Monospace,
+                                lineHeight = 15.sp
                             )
                         }
                     }
 
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(12.dp))
 
                     if (companion.isRecruited) {
-                        CyberButton(
-                            onClick = { viewModel.triggerCompanionBond(companion.name) },
-                            text = "GIFT",
-                            color = QuantumNeonGreen,
-                            modifier = Modifier.width(70.dp),
-                            enabled = gameState.credits >= 100
-                        )
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            horizontalAlignment = Alignment.End
+                        ) {
+                            CyberButton(
+                                onClick = { viewModel.triggerCompanionBond(companion.name) },
+                                text = "GIFT",
+                                color = QuantumNeonGreen,
+                                modifier = Modifier.width(85.dp),
+                                enabled = credits >= 100
+                            )
+                            CyberButton(
+                                onClick = { onOpenCyberware(companion) },
+                                text = "🧬 CHIPS",
+                                color = QuantumNeonBlue,
+                                modifier = Modifier.width(85.dp)
+                            )
+                        }
                     } else {
+                        val isRecruitQuestAvailable = companion.name == "Drox"
                         CyberButton(
-                            onClick = { viewModel.triggerCompanionBond(companion.name) },
-                            text = "RECRUIT",
-                            color = QuantumNeonBlue,
+                            onClick = { 
+                                if (!isRecruitQuestAvailable) {
+                                    viewModel.triggerCompanionBond(companion.name) 
+                                }
+                            },
+                            text = if (isRecruitQuestAvailable) "BY QUEST" else "RECRUIT",
+                            color = if (isRecruitQuestAvailable) QuantumNeonOrange else QuantumNeonBlue,
                             modifier = Modifier.width(90.dp),
-                            enabled = gameState.credits >= 100
+                            enabled = !isRecruitQuestAvailable && credits >= 100
                         )
                     }
                 }
@@ -4074,7 +8093,1040 @@ fun CompanionsScreen(
     }
 }
 
+@Composable
+fun CompanionCyberwareGridScreen(
+    companion: CompanionRecord,
+    gameState: GameState,
+    viewModel: GameViewModel,
+    onBack: () -> Unit
+) {
+    var selectedSlot by remember { mutableStateOf("Cranial") }
+    var selectedChipAlpha by remember { mutableStateOf<CyberwareChip?>(null) }
+    var selectedChipBeta by remember { mutableStateOf<CyberwareChip?>(null) }
+    
+    var isSlicing by remember { mutableStateOf(false) }
+    var sliceProgress by remember { mutableStateOf(0f) }
+    var sliceLogText by remember { mutableStateOf("") }
+    var splicedChipResult by remember { mutableStateOf<CyberwareChip?>(null) }
+    
+    val scope = rememberCoroutineScope()
+    val stats = calculateCompanionStats(companion)
+
+    // Unlocked base chips categorized by slot
+    val baseChips = when (selectedSlot) {
+        "Cranial" -> listOf(
+            CyberwareChip("Neural Processor V1", atkBonus = 15, magBonus = 10, desc = "Overclocks cortex response loops."),
+            CyberwareChip("Tactical HUD Link", spdBonus = 15, lckBonus = 10, desc = "Overlays target lock vectors on retinas."),
+            CyberwareChip("AI Co-Pilot Synapse", magBonus = 20, mpBonus = 10, desc = "Links cerebral cortex directly to drone autopilot.")
+        )
+        "Dermal" -> listOf(
+            CyberwareChip("Titanium Carapace V1", defBonus = 25, desc = "Dense metallic plate infused with subdermal fibers."),
+            CyberwareChip("Nanite Aegis Field", hpBonus = 50, defBonus = 15, desc = "Sheds energy impacts via active nanite layer."),
+            CyberwareChip("Thermal Graphene Mesh", hpBonus = 40, mpBonus = 10, desc = "Regulates biomechanical thermal flow.")
+        )
+        "Actuators" -> listOf(
+            CyberwareChip("Hydraulic Pistons V1", atkBonus = 20, hpBonus = 10, desc = "High-pressure fluid lines for brute impact force."),
+            CyberwareChip("Tachyon Thruster Rails", spdBonus = 25, desc = "Magnetic propulsion vents mounted to skeletal frames."),
+            CyberwareChip("Myomer Reflex Weave", spdBonus = 15, lckBonus = 15, desc = "Synthetic muscle fibers reacting at near lightspeed.")
+        )
+        "Reactor" -> listOf(
+            CyberwareChip("Singularity Resonance Core", magBonus = 20, mpBonus = 15, desc = "Captures gravity wave fluctuations."),
+            CyberwareChip("Nanite Battery Conduit", hpBonus = 60, mpBonus = 15, desc = "Backup cellular battery stack."),
+            CyberwareChip("Void Spark Inverter", mpBonus = 30, lckBonus = 10, desc = "Extracts energy directly from parallel sub-sectors.")
+        )
+        else -> emptyList()
+    }
+
+    // Automatically assign defaults if none selected yet
+    LaunchedEffect(selectedSlot) {
+        if (baseChips.size >= 2) {
+            selectedChipAlpha = baseChips[0]
+            selectedChipBeta = baseChips[1]
+        }
+        splicedChipResult = null
+    }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Lab Header with back button
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "🧬 BIOMECH SPLICING LAB",
+                        fontSize = 18.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = QuantumNeonBlue
+                    )
+                    Text(
+                        text = "UNIT NODE: ${companion.name.uppercase()}",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = QuantumGrayText
+                    )
+                }
+                CyberButton(
+                    onClick = onBack,
+                    text = "⬅ REGRISTY",
+                    color = QuantumNeonPurple,
+                    modifier = Modifier.width(110.dp)
+                )
+            }
+        }
+
+        // Diagnostic Stats Board
+        item {
+            CyberCard(borderColor = QuantumNeonBlue) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(60.dp)
+                            .background(QuantumDarkBg, RoundedCornerShape(30.dp))
+                            .border(1.dp, QuantumNeonBlue, RoundedCornerShape(30.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(companion.portraitSymbol, fontSize = 28.sp)
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "${companion.name.uppercase()} // LVL ${companion.level} ${companion.role.uppercase()}",
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        
+                        // Mini columns for stats
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("HP: ${stats["HP"]} (${stats["baseHp"]} + ${stats["extraHp"]})", fontSize = 10.sp, color = QuantumNeonGreen, fontFamily = FontFamily.Monospace)
+                                Text("MP: ${stats["MP"]} (${stats["baseMp"]} + ${stats["extraMp"]})", fontSize = 10.sp, color = QuantumNeonBlue, fontFamily = FontFamily.Monospace)
+                                Text("ATK: ${stats["ATK"]} (${stats["baseAtk"]} + ${stats["extraAtk"]})", fontSize = 10.sp, color = QuantumNeonOrange, fontFamily = FontFamily.Monospace)
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("DEF: ${stats["DEF"]} (${stats["baseDef"]} + ${stats["extraDef"]})", fontSize = 10.sp, color = QuantumNeonGreen, fontFamily = FontFamily.Monospace)
+                                Text("MAG: ${stats["MAG"]} (${stats["baseMag"]} + ${stats["extraMag"]})", fontSize = 10.sp, color = QuantumNeonPurple, fontFamily = FontFamily.Monospace)
+                                Text("SPD: ${stats["SPD"]} (${stats["baseSpd"]} + ${stats["extraSpd"]})", fontSize = 10.sp, color = QuantumNeonBlue, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Interactive Canvas Blueprint Schematic
+        item {
+            val infiniteTransition = rememberInfiniteTransition()
+            val pulseProgress by infiniteTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(2000, easing = LinearEasing),
+                    repeatMode = RepeatMode.Restart
+                )
+            )
+
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(170.dp)
+                    .background(Color.Black.copy(alpha = 0.5f))
+                    .border(1.dp, QuantumBorder.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
+            ) {
+                val w = size.width
+                val h = size.height
+                val centerX = w / 2f
+                
+                val headOffset = Offset(centerX, h * 0.16f)
+                val dermalOffset = Offset(centerX, h * 0.45f)
+                val actuatorsLeft = Offset(centerX - w * 0.22f, h * 0.52f)
+                val actuatorsRight = Offset(centerX + w * 0.22f, h * 0.52f)
+                val reactorOffset = Offset(centerX, h * 0.80f)
+
+                // Grid BG
+                val step = 15.dp.toPx()
+                for (x in 0..(w / step).toInt()) {
+                    drawLine(Color(0xFF0D1B2A).copy(alpha = 0.2f), Offset(x * step, 0f), Offset(x * step, h), 1f)
+                }
+                for (y in 0..(h / step).toInt()) {
+                    drawLine(Color(0xFF0D1B2A).copy(alpha = 0.2f), Offset(0f, y * step), Offset(w, y * step), 1f)
+                }
+
+                // Cyber skeletal lines
+                drawLine(QuantumNeonBlue.copy(alpha = 0.25f), headOffset, dermalOffset, 4f)
+                drawLine(QuantumNeonBlue.copy(alpha = 0.25f), dermalOffset, actuatorsLeft, 3f)
+                drawLine(QuantumNeonBlue.copy(alpha = 0.25f), dermalOffset, actuatorsRight, 3f)
+                drawLine(QuantumNeonBlue.copy(alpha = 0.25f), dermalOffset, reactorOffset, 4f)
+
+                // Draw pulsing feedback line
+                val travel = (pulseProgress * 100).toInt() % 100 / 100f
+                val movingY = headOffset.y + (reactorOffset.y - headOffset.y) * travel
+                drawCircle(QuantumNeonOrange.copy(alpha = 0.7f), 5f, Offset(centerX, movingY))
+
+                // Node Circles
+                drawSchematicNode(this, headOffset, selectedSlot == "Cranial", QuantumNeonBlue)
+                drawSchematicNode(this, dermalOffset, selectedSlot == "Dermal", QuantumNeonGreen)
+                drawSchematicNode(this, actuatorsLeft, selectedSlot == "Actuators", QuantumNeonPurple)
+                drawSchematicNode(this, actuatorsRight, selectedSlot == "Actuators", QuantumNeonPurple)
+                drawSchematicNode(this, reactorOffset, selectedSlot == "Reactor", QuantumNeonOrange)
+            }
+        }
+
+        // Grid node selectors
+        item {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "SELECT CHASSIS BIOPORT NODE:",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    color = QuantumNeonOrange
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    val nodes = listOf(
+                        Triple("Cranial", "🧠 CRANIAL CORE", QuantumNeonBlue),
+                        Triple("Dermal", "🛡 DERMAL SHELL", QuantumNeonGreen),
+                        Triple("Actuators", "🦾 ACTUATORS", QuantumNeonPurple),
+                        Triple("Reactor", "🔋 REACTOR CORE", QuantumNeonOrange)
+                    )
+
+                    nodes.forEach { (nodeKey, nodeLabel, color) ->
+                        val isSelected = selectedSlot == nodeKey
+                        Card(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(38.dp)
+                                .clickable { selectedSlot = nodeKey }
+                                .border(
+                                    1.dp,
+                                    if (isSelected) color else color.copy(alpha = 0.25f),
+                                    RoundedCornerShape(4.dp)
+                                ),
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (isSelected) color.copy(alpha = 0.15f) else Color.Transparent
+                            ),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = nodeLabel,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = if (isSelected) Color.White else Color.Gray,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Current Slot fitted chip status card
+        item {
+            val dbVal = when (selectedSlot) {
+                "Cranial" -> companion.weaponEquipped
+                "Dermal" -> companion.armorEquipped
+                "Actuators" -> companion.accessoryEquipped
+                "Reactor" -> companion.moduleEquipped
+                else -> "None"
+            }
+            val currentFittedChip = parseGearToChip(dbVal)
+
+            CyberCard(borderColor = if (dbVal != "None") QuantumNeonGreen else QuantumBorder) {
+                Text(
+                    text = "CURRENT FITTED MODULE: [${selectedSlot.uppercase()} PORT]",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    color = QuantumNeonGreen
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = currentFittedChip.name,
+                    fontSize = 15.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    color = if (dbVal != "None") QuantumNeonGreen else Color.Gray
+                )
+                if (dbVal != "None") {
+                    Text(
+                        text = "STATS MOD: " + formatChipStats(currentFittedChip),
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = QuantumNeonOrange
+                    )
+                }
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = currentFittedChip.desc,
+                    fontSize = 11.sp,
+                    color = QuantumGrayText
+                )
+
+                if (dbVal != "None") {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    CyberButton(
+                        onClick = {
+                            val dbSlot = when (selectedSlot) {
+                                "Cranial" -> "weapon"
+                                "Dermal" -> "armor"
+                                "Actuators" -> "accessory"
+                                "Reactor" -> "module"
+                                else -> "module"
+                            }
+                            viewModel.equipCompanionGear(companion.name, dbSlot, "None")
+                        },
+                        text = "🔌 UNINSTALL CHIP",
+                        color = QuantumNeonRed,
+                        modifier = Modifier.height(38.dp).fillMaxWidth()
+                    )
+                }
+            }
+        }
+
+        // Biomech Customizer options (Direct equip base chips OR splice together)
+        item {
+            Text(
+                text = "🔧 FACTORY PORT CHIP LIBRARY",
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                color = QuantumNeonBlue
+            )
+        }
+
+        // Render base customizable chips that they can install directly
+        items(baseChips) { baseChip ->
+            CyberCard(borderColor = QuantumNeonBlue.copy(alpha = 0.5f)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = baseChip.name,
+                            fontSize = 14.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                        Text(
+                            text = formatChipStats(baseChip),
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = QuantumNeonOrange
+                        )
+                        Text(
+                            text = baseChip.desc,
+                            fontSize = 11.sp,
+                            color = QuantumGrayText
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    CyberButton(
+                        onClick = {
+                            val formattedName = "${baseChip.name} (" + formatChipStats(baseChip) + ")"
+                            val dbSlot = when (selectedSlot) {
+                                "Cranial" -> "weapon"
+                                "Dermal" -> "armor"
+                                "Actuators" -> "accessory"
+                                "Reactor" -> "module"
+                                else -> "module"
+                            }
+                            viewModel.equipCompanionGear(companion.name, dbSlot, formattedName)
+                        },
+                        text = "INSTALL",
+                        color = QuantumNeonBlue,
+                        modifier = Modifier.width(85.dp).height(40.dp)
+                    )
+                }
+            }
+        }
+
+        // Splicing Matrix Lab section
+        item {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "🧬 BIOMECHANICAL CYBERWARE SPLICER MATRIX",
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                color = QuantumNeonPurple
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Slice together two base cybernetic components below to fuse their quantum channels. Dual-fused chips possess combined bio-currents and a +25% stat bonus multiplier!",
+                fontSize = 11.sp,
+                color = QuantumGrayText,
+                lineHeight = 15.sp
+            )
+        }
+
+        item {
+            CyberCard(borderColor = QuantumNeonPurple) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    // Selection rows
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("CORE ELEMENT ALPHA:", fontSize = 9.sp, fontFamily = FontFamily.Monospace, color = QuantumGrayText)
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(QuantumDarkBg, RoundedCornerShape(4.dp))
+                                    .border(1.dp, QuantumBorder, RoundedCornerShape(4.dp))
+                                    .padding(8.dp)
+                            ) {
+                                Text(
+                                    text = selectedChipAlpha?.name ?: "Select Alpha",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color.White
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            // Simple horizontal list to choose Alpha
+                            Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                baseChips.forEach { chip ->
+                                    val isSelected = selectedChipAlpha?.name == chip.name
+                                    Box(
+                                        modifier = Modifier
+                                            .background(if (isSelected) QuantumNeonBlue.copy(alpha = 0.2f) else Color.Transparent, RoundedCornerShape(2.dp))
+                                            .border(1.dp, if (isSelected) QuantumNeonBlue else Color.DarkGray, RoundedCornerShape(2.dp))
+                                            .clickable { selectedChipAlpha = chip }
+                                            .padding(horizontal = 6.dp, vertical = 3.dp)
+                                    ) {
+                                        Text(chip.name.substringBefore(" V1"), fontSize = 8.sp, color = if (isSelected) Color.White else Color.Gray)
+                                    }
+                                }
+                            }
+                        }
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("CORE ELEMENT BETA:", fontSize = 9.sp, fontFamily = FontFamily.Monospace, color = QuantumGrayText)
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(QuantumDarkBg, RoundedCornerShape(4.dp))
+                                    .border(1.dp, QuantumBorder, RoundedCornerShape(4.dp))
+                                    .padding(8.dp)
+                            ) {
+                                Text(
+                                    text = selectedChipBeta?.name ?: "Select Beta",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = Color.White
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            // Simple horizontal list to choose Beta
+                            Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                baseChips.forEach { chip ->
+                                    val isSelected = selectedChipBeta?.name == chip.name
+                                    Box(
+                                        modifier = Modifier
+                                            .background(if (isSelected) QuantumNeonBlue.copy(alpha = 0.2f) else Color.Transparent, RoundedCornerShape(2.dp))
+                                            .border(1.dp, if (isSelected) QuantumNeonBlue else Color.DarkGray, RoundedCornerShape(2.dp))
+                                            .clickable { selectedChipBeta = chip }
+                                            .padding(horizontal = 6.dp, vertical = 3.dp)
+                                    ) {
+                                        Text(chip.name.substringBefore(" V1"), fontSize = 8.sp, color = if (isSelected) Color.White else Color.Gray)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Splicing progress bar
+                    if (isSlicing) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                text = "⚡ $sliceLogText",
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = QuantumNeonPurple
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            CyberProgressBar(
+                                progress = sliceProgress,
+                                label = "INTEGRATING CORE COUPLINGS",
+                                valueText = "${(sliceProgress * 100).toInt()}%",
+                                color = QuantumNeonPurple
+                            )
+                        }
+                    }
+
+                    // Spliced result card
+                    val result = splicedChipResult
+                    if (result != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(QuantumNeonPurple.copy(alpha = 0.08f), RoundedCornerShape(4.dp))
+                                .border(1.dp, QuantumNeonPurple, RoundedCornerShape(4.dp))
+                                .padding(10.dp)
+                        ) {
+                            Column {
+                                Text(
+                                    text = "SUCCESS // FUSED CHIP SYNTHESIZED:",
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    color = QuantumNeonPurple
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = result.name,
+                                    fontSize = 15.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    color = QuantumNeonPurple
+                                )
+                                Text(
+                                    text = "FUSED POWER MOD: " + formatChipStats(result),
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = QuantumNeonOrange
+                                )
+                                Text(
+                                    text = result.desc,
+                                    fontSize = 11.sp,
+                                    color = QuantumLightText.copy(alpha = 0.8f)
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                CyberButton(
+                                    onClick = {
+                                        val formattedName = "${result.name} (" + formatChipStats(result) + ")"
+                                        val dbSlot = when (selectedSlot) {
+                                            "Cranial" -> "weapon"
+                                            "Dermal" -> "armor"
+                                            "Actuators" -> "accessory"
+                                            "Reactor" -> "module"
+                                            else -> "module"
+                                        }
+                                        viewModel.equipCompanionGear(companion.name, dbSlot, formattedName)
+                                        splicedChipResult = null
+                                    },
+                                    text = "🔌 SECURE INTO CHASSIS BIOPORT",
+                                    color = QuantumNeonGreen,
+                                    modifier = Modifier.fillMaxWidth().height(40.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    // Splicing active launch triggers
+                    val isEnoughResources = gameState.credits >= 150 && gameState.nanites >= 20
+                    val isSameChipSelected = selectedChipAlpha?.name == selectedChipBeta?.name
+                    
+                    if (result == null && !isSlicing) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text("COST DE-SEQUENCE:", fontSize = 9.sp, color = QuantumGrayText)
+                                Text("150 Solis Sol • 20 Nanites", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (isEnoughResources) QuantumNeonGreen else QuantumNeonRed)
+                            }
+                            CyberButton(
+                                onClick = {
+                                    if (isEnoughResources) {
+                                        viewModel.addResources(-150, -20, 0)
+                                        scope.launch {
+                                            isSlicing = true
+                                            sliceProgress = 0f
+                                            val steps = listOf(
+                                                "ISOLATING BIO-SYNAPTIC ALIGNMENTS..." to 0.2f,
+                                                "STABILIZING QUANTUM CHASSIS FEEDBACK..." to 0.5f,
+                                                "MERGING CHIP VECTORS & NANITE CORDS..." to 0.8f,
+                                                "CONSOLIDATING STATS MATRIX..." to 0.95f,
+                                                "SUCCESS // HYBRID FUSION ESTABLISHED!" to 1.0f
+                                            )
+                                            for (step in steps) {
+                                                sliceLogText = step.first
+                                                val targetProgress = step.second
+                                                while (sliceProgress < targetProgress) {
+                                                    delay(60)
+                                                    sliceProgress += 0.05f
+                                                }
+                                                delay(250)
+                                            }
+                                            
+                                            val alpha = selectedChipAlpha ?: baseChips[0]
+                                            val beta = selectedChipBeta ?: baseChips[1]
+                                            val fName = getFusedName(alpha.name, beta.name, selectedSlot)
+                                            
+                                            splicedChipResult = CyberwareChip(
+                                                name = "$fName [SPLICED]",
+                                                hpBonus = ((alpha.hpBonus + beta.hpBonus) * 1.25f).roundToInt(),
+                                                mpBonus = ((alpha.mpBonus + beta.mpBonus) * 1.25f).roundToInt(),
+                                                atkBonus = ((alpha.atkBonus + beta.atkBonus) * 1.25f).roundToInt(),
+                                                defBonus = ((alpha.defBonus + beta.defBonus) * 1.25f).roundToInt(),
+                                                magBonus = ((alpha.magBonus + beta.magBonus) * 1.25f).roundToInt(),
+                                                spdBonus = ((alpha.spdBonus + beta.spdBonus) * 1.25f).roundToInt(),
+                                                lckBonus = ((alpha.lckBonus + beta.lckBonus) * 1.25f).roundToInt(),
+                                                desc = "Perfect dual-fused biomechanical cyber-chip with active 25% fusion multiplier."
+                                            )
+                                            isSlicing = false
+                                        }
+                                    }
+                                },
+                                text = "🧬 SLICE PATHWAYS",
+                                color = QuantumNeonPurple,
+                                modifier = Modifier.width(140.dp),
+                                enabled = isEnoughResources
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fun drawSchematicNode(
+    drawScope: androidx.compose.ui.graphics.drawscope.DrawScope,
+    center: Offset,
+    isSelected: Boolean,
+    color: Color
+) {
+    with(drawScope) {
+        val radius = 10.dp.toPx()
+        drawScope.drawCircle(
+            color = if (isSelected) color else color.copy(alpha = 0.35f),
+            radius = radius,
+            center = center,
+            style = Stroke(width = if (isSelected) 3.dp.toPx() else 1.dp.toPx())
+        )
+        drawScope.drawCircle(
+            color = if (isSelected) color.copy(alpha = 0.2f) else Color.Black.copy(alpha = 0.5f),
+            radius = radius - 2.dp.toPx(),
+            center = center
+        )
+        if (isSelected) {
+            drawScope.drawCircle(
+                color = color.copy(alpha = 0.4f),
+                radius = radius + 5.dp.toPx(),
+                center = center,
+                style = Stroke(width = 1.dp.toPx())
+            )
+        }
+    }
+}
+
 // --- SCREEN 5: RETRO COMBAT SIMULATOR ---
+
+@Composable
+fun TacticianRadioCompanionUi(
+    viewModel: GameViewModel,
+    gameState: GameState,
+    battleState: BattleState
+) {
+    val activeCompName by viewModel.activeCompanionName.collectAsStateWithLifecycle()
+    var tunedCompanion by remember { mutableStateOf("ATOM") }
+
+    LaunchedEffect(activeCompName) {
+        if (activeCompName in listOf("ATOM", "Lyra", "Nix")) {
+            tunedCompanion = activeCompName ?: "ATOM"
+        }
+    }
+
+    val aurelianRep = gameState.factionReputations[Faction.AURELIAN_ORDER] ?: 0
+    val emberpactRep = gameState.factionReputations[Faction.EMBERPACT] ?: 0
+    
+    val alignment = when {
+        aurelianRep > emberpactRep && aurelianRep > 10 -> "Enlighteners"
+        emberpactRep > aurelianRep && emberpactRep > 10 -> "Technopunks"
+        else -> "Neutral"
+    }
+
+    val playerHpPct = battleState.playerHp.toFloat() / battleState.playerMaxHp.coerceAtLeast(1)
+    val enemyHpPct = battleState.activeEnemy?.let { it.currentHp.toFloat() / it.maxHp.coerceAtLeast(1) } ?: 1f
+    
+    val dialogueFeed = when (tunedCompanion) {
+        "Lyra" -> {
+            when (alignment) {
+                "Enlighteners" -> {
+                    when {
+                        playerHpPct < 0.4f -> "STATUS CRITICAL! Diverting Aurelian tactical reserve files. Do not break coordinate formation, Operator!"
+                        enemyHpPct < 0.4f -> "Hostile signature destabilizing. Focus your quantum discharge. Aurelian security overrides are absolute!"
+                        else -> "Excellent discipline, initiate. The Aurelian Grid registers optimal synchronized telemetry. Maintain shield cohesion."
+                    }
+                }
+                "Technopunks" -> {
+                    when {
+                        playerHpPct < 0.4f -> "Chassis integrity failing. Even rogue scrap-mercs require security. Activating auxiliary nanite recovery... reluctantly."
+                        enemyHpPct < 0.4f -> "The target is collapsing, but your tactics are extremely reckless. Standard Aurelian protocol is preferred."
+                        else -> "I am monitoring your frequency, outlaw. You're fighting with chaotic scrap elements. Try to maintain some order."
+                    }
+                }
+                else -> {
+                    when {
+                        playerHpPct < 0.4f -> "Warning: Bio-vitality dropping below safety thresholds. Cycle dynamic phase shields immediately."
+                        enemyHpPct < 0.4f -> "Hostile shields collapsing. Combat efficiency: Satisfactory. Secure coordinate salvage."
+                        else -> "Radio connection stable. Solis Sentinel tactical array scanning for spatial anomalies. Stay sharp, Operator."
+                    }
+                }
+            }
+        }
+        "Nix" -> {
+            when (alignment) {
+                "Enlighteners" -> {
+                    when {
+                        playerHpPct < 0.4f -> "Yikes! Your vitals are tanking, boss! Don't rely on those corporate elite archives—overclock your system now!"
+                        enemyHpPct < 0.4f -> "They're going down! Quick, extract their memory matrix before the Aurelian central core scrubs the logs!"
+                        else -> "Tuning into your frequency, corporate puppet. Nice shiny Aurelian uniform, but try not to let it get scorched."
+                    }
+                }
+                "Technopunks" -> {
+                    when {
+                        playerHpPct < 0.4f -> "Damn, they hit you hard! Bypass security limiters and feed raw plasma into your injectors! Live to fight!"
+                        enemyHpPct < 0.4f -> "Haha! Hostile firewall is totally fried! Shred them and salvage the rest. Leave nothing for corporate!"
+                        else -> "That's what I'm talking about! Let the rebel sparks fly! Emberpact grids are buzzing with your combat telemetry!"
+                    }
+                }
+                else -> {
+                    when {
+                        playerHpPct < 0.4f -> "Ouch, your cyber-chassis is sparking badly. Quick, bypass safety locks and trigger healing pulses!"
+                        enemyHpPct < 0.4f -> "Hostile core is collapsing! Hit 'em with a final Quantum Burst and let's cash in."
+                        else -> "Hey kid! Tapped into the hostile frequency. Watch out for their overcharged resonator. Keep it chaotic!"
+                    }
+                }
+            }
+        }
+        else -> {
+            when (alignment) {
+                "Enlighteners" -> {
+                    when {
+                        playerHpPct < 0.4f -> "[DIAGNOSTIC] Vital systems at 38%. Recommending immediate Aurelian electrostatic phase barrier deployment."
+                        enemyHpPct < 0.4f -> "[ANALYSIS] Target physical structure fractured. Recommended action: Synchronize high-energy discharge."
+                        else -> "[GUARDIAN STATE] Scanning Aurelian Order encryption. Machine-logic registers 94.2% local battle synchronization."
+                    }
+                }
+                "Technopunks" -> {
+                    when {
+                        playerHpPct < 0.4f -> "[ALERT] Critical nanite fluid leakage. Restoring active subatomic compounds at maximum capacity."
+                        enemyHpPct < 0.4f -> "[DATA] Hostile defense capabilities degraded by 88%. Probability of rare scrap-metal loot: 99.1%."
+                        else -> "[SCAN] Non-standard scrap-materials detected in weaponry. Calibrating targeting processors to compensate."
+                    }
+                }
+                else -> {
+                    when {
+                        playerHpPct < 0.4f -> "[VITAL WARN] Operator's chassis at risk. Recommended action: Execute Healing Pulse or enter defensive deflect."
+                        enemyHpPct < 0.4f -> "[PROJECTION] Hostile energy field depleted. Quantum spacetime coordinates stabilizing."
+                        else -> "[TACTICAL LINK] Scanner online. Enemy vulnerability verified: Quantum Energy. Awaiting command."
+                    }
+                }
+            }
+        }
+    }
+
+    val compColor = when (tunedCompanion) {
+        "Lyra" -> QuantumNeonBlue
+        "Nix" -> QuantumNeonOrange
+        "ATOM" -> QuantumNeonGreen
+        else -> QuantumNeonPurple
+    }
+    
+    val compAvatar = when (tunedCompanion) {
+        "Lyra" -> "🏹"
+        "Nix" -> "🧑‍💻"
+        "ATOM" -> "🤖"
+        else -> "📡"
+    }
+
+    val compTitle = when (tunedCompanion) {
+        "Lyra" -> "SENTINEL COM. LYRA"
+        "Nix" -> "GRID HACKER NIX"
+        "ATOM" -> "DEFENSE MECH ATOM"
+        else -> "COMPANION AI"
+    }
+
+    val compSub = when (tunedCompanion) {
+        "Lyra" -> "Aurelian Tactical Secure Feed"
+        "Nix" -> "Rebel Raider Encrypted Signal"
+        "ATOM" -> "Ironward Subatomic Diagnostics"
+        else -> "Tactical Signal Link"
+    }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "soundwave")
+    val pulse1 by infiniteTransition.animateFloat(
+        initialValue = 0.2f, targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(androidx.compose.animation.core.tween(600, easing = androidx.compose.animation.core.LinearEasing), androidx.compose.animation.core.RepeatMode.Reverse),
+        label = "p1"
+    )
+    val pulse2 by infiniteTransition.animateFloat(
+        initialValue = 0.3f, targetValue = 0.9f,
+        animationSpec = infiniteRepeatable(androidx.compose.animation.core.tween(450, easing = androidx.compose.animation.core.LinearEasing), androidx.compose.animation.core.RepeatMode.Reverse),
+        label = "p2"
+    )
+    val pulse3 by infiniteTransition.animateFloat(
+        initialValue = 0.1f, targetValue = 0.8f,
+        animationSpec = infiniteRepeatable(androidx.compose.animation.core.tween(750, easing = androidx.compose.animation.core.LinearEasing), androidx.compose.animation.core.RepeatMode.Reverse),
+        label = "p3"
+    )
+    val pulse4 by infiniteTransition.animateFloat(
+        initialValue = 0.4f, targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(androidx.compose.animation.core.tween(500, easing = androidx.compose.animation.core.LinearEasing), androidx.compose.animation.core.RepeatMode.Reverse),
+        label = "p4"
+    )
+
+    CyberCard(borderColor = compColor) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "📻 DEUS-EX TACTICAL RADIO",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    color = compColor
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(androidx.compose.foundation.shape.CircleShape)
+                        .background(compColor.copy(alpha = pulse2))
+                )
+            }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.height(14.dp)
+            ) {
+                listOf(pulse1, pulse2, pulse3, pulse4, pulse2, pulse1).forEach { scale ->
+                    Box(
+                        modifier = Modifier
+                            .width(2.dp)
+                            .height(14.dp * scale)
+                            .background(compColor)
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            listOf("ATOM", "Lyra", "Nix").forEach { name ->
+                val isSelected = tunedCompanion == name
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(if (isSelected) compColor.copy(alpha = 0.2f) else Color.Transparent)
+                        .border(1.dp, if (isSelected) compColor else QuantumBorder, RoundedCornerShape(4.dp))
+                        .clickable { tunedCompanion = name }
+                        .padding(vertical = 4.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "${if (name == "ATOM") "🤖" else if (name == "Lyra") "🏹" else "🧑‍💻"} $name",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (isSelected) compColor else Color.Gray,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color.Black.copy(alpha = 0.4f))
+                .border(1.dp, QuantumBorder, RoundedCornerShape(6.dp))
+                .padding(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.width(64.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(compColor.copy(alpha = 0.15f))
+                        .border(1.dp, compColor, RoundedCornerShape(6.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(compAvatar, fontSize = 24.sp)
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "REP: ${
+                        when (tunedCompanion) {
+                            "Lyra" -> aurelianRep
+                            "Nix" -> emberpactRep
+                            else -> "100%"
+                        }
+                    }",
+                    fontSize = 8.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = compColor,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = compTitle,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = compColor
+                    )
+                    Text(
+                        text = "ALIGN: ${alignment.uppercase()}",
+                        fontSize = 7.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color.LightGray,
+                        modifier = Modifier
+                            .background(Color.White.copy(alpha = 0.1f))
+                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                    )
+                }
+                Text(
+                    text = compSub,
+                    fontSize = 8.sp,
+                    color = Color.Gray,
+                    fontFamily = FontFamily.Monospace
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "\"$dialogueFeed\"",
+                    fontSize = 11.sp,
+                    color = QuantumLightText,
+                    lineHeight = 14.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(compColor.copy(alpha = 0.1f))
+                    .border(1.dp, compColor.copy(alpha = 0.3f), RoundedCornerShape(4.dp))
+                    .clickable {
+                        val fullLog = "📻 [RADIO - $tunedCompanion]: $dialogueFeed"
+                        viewModel.injectCombatLog(fullLog, false, compColor.value.toLong())
+                    }
+                    .padding(vertical = 6.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "📥 BROADCAST TO TERMINAL LOGS",
+                    fontSize = 9.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = compColor,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color.Transparent)
+                    .border(1.dp, Color.Gray.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
+                    .clickable {
+                        val enemyName = battleState.activeEnemy?.name ?: "Unknown Hostile"
+                        val vulnerability = battleState.activeEnemy?.vulnerability ?: "None"
+                        val feedback = "🛰️ [ANALYSER - $tunedCompanion]: Target '$enemyName' scan finished. Vulnerability: $vulnerability."
+                        viewModel.injectCombatLog(feedback, false, Color.LightGray.value.toLong())
+                    }
+                    .padding(vertical = 6.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "🔍 TRIGGER DIAGNOSTIC SCAN",
+                    fontSize = 9.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color.LightGray,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+data class NeonCombatSpark(
+    val id: Int,
+    val x: Float,
+    val y: Float,
+    val vx: Float,
+    val vy: Float,
+    val color: Color,
+    val radius: Float,
+    val life: Float
+)
+
+data class DamageTextFloater(
+    val id: Int,
+    val text: String,
+    val x: Float,
+    val y: Float,
+    val color: Color,
+    val scale: Float,
+    val life: Float
+)
 
 @Composable
 fun CombatScreen(
@@ -4082,7 +9134,127 @@ fun CombatScreen(
     gameState: GameState,
     onNavigateBack: () -> Unit
 ) {
-    val battleState by viewModel.battleState.collectAsState()
+    val battleState by viewModel.battleState.collectAsStateWithLifecycle()
+
+    val sparkPool = remember { Array(120) { MutableNeonSpark() } }
+    val floaterPool = remember { Array(10) { MutableDamageFloater() } }
+    var shakeOffset by remember { mutableStateOf(Offset(0f, 0f)) }
+    var tickState by remember { mutableStateOf(0) }
+
+    var prevPlayerHp by remember { mutableStateOf(battleState.playerHp) }
+    var prevEnemyHp by remember { mutableStateOf(battleState.activeEnemy?.currentHp ?: 0) }
+
+    fun triggerSparks(originX: Float, originY: Float, color: Color, count: Int) {
+        var spawned = 0
+        for (spark in sparkPool) {
+            if (!spark.active) {
+                spark.active = true
+                spark.x = originX
+                spark.y = originY
+                spark.vx = (Random.nextFloat() * 0.12f - 0.06f)
+                spark.vy = (Random.nextFloat() * -0.15f - 0.02f)
+                spark.color = color
+                spark.radius = Random.nextFloat() * 7f + 3f
+                spark.life = 1f
+                spawned++
+                if (spawned >= count) break
+            }
+        }
+    }
+
+    fun triggerFloater(text: String, originX: Float, originY: Float, color: Color, scale: Float) {
+        for (floater in floaterPool) {
+            if (!floater.active) {
+                floater.active = true
+                floater.text = text
+                floater.x = originX
+                floater.y = originY
+                floater.color = color
+                floater.scale = scale
+                floater.life = 1f
+                break
+            }
+        }
+    }
+
+    // Monitor Player HP changes for impact feedback
+    LaunchedEffect(battleState.playerHp) {
+        val diff = prevPlayerHp - battleState.playerHp
+        if (diff > 0) {
+            shakeOffset = Offset(
+                (Random.nextFloat() * 24f - 12f),
+                (Random.nextFloat() * 24f - 12f)
+            )
+            triggerSparks(0.25f, 0.35f, Color(0xFFFF1133), 16)
+            triggerFloater("-$diff HP", 0.22f, 0.25f, QuantumNeonRed, 1.3f)
+        }
+        prevPlayerHp = battleState.playerHp
+    }
+
+    // Monitor Enemy HP changes for impact feedback
+    val enemyHp = battleState.activeEnemy?.currentHp ?: 0
+    LaunchedEffect(enemyHp) {
+        val diff = prevEnemyHp - enemyHp
+        if (diff > 0) {
+            shakeOffset = Offset(
+                (Random.nextFloat() * 24f - 12f),
+                (Random.nextFloat() * 24f - 12f)
+            )
+            val randomEnemyColor = listOf(QuantumNeonPurple, QuantumNeonBlue, QuantumNeonOrange, QuantumNeonGreen).random()
+            triggerSparks(0.75f, 0.35f, randomEnemyColor, 18)
+            triggerFloater("-$diff", 0.72f, 0.25f, randomEnemyColor, 1.6f)
+        }
+        prevEnemyHp = enemyHp
+    }
+
+    // Zero-Allocation Physics Animation Loop with high-stability display-locked tick
+    LaunchedEffect(Unit) {
+        while (true) {
+            withFrameMillis { frameTime ->
+                var needsTick = false
+                
+                // Spark updates
+                for (spark in sparkPool) {
+                    if (spark.active) {
+                        spark.x += spark.vx
+                        spark.y += spark.vy
+                        spark.vy += 0.005f // gravity simulation
+                        spark.life -= 0.04f
+                        if (spark.life <= 0f) {
+                            spark.active = false
+                        } else {
+                            needsTick = true
+                        }
+                    }
+                }
+
+                // Floater updates
+                for (floater in floaterPool) {
+                    if (floater.active) {
+                        floater.y -= 0.015f // float up
+                        floater.life -= 0.03f
+                        if (floater.life <= 0f) {
+                            floater.active = false
+                        } else {
+                            needsTick = true
+                        }
+                    }
+                }
+
+                // Screen shake dampening
+                if (shakeOffset != Offset.Zero) {
+                    val nextX = if (kotlin.math.abs(shakeOffset.x) < 0.5f) 0f else -shakeOffset.x * 0.7f
+                    val nextY = if (kotlin.math.abs(shakeOffset.y) < 0.5f) 0f else -shakeOffset.y * 0.7f
+                    shakeOffset = Offset(nextX, nextY)
+                    needsTick = true
+                }
+
+                if (needsTick || tickState > 0) {
+                    tickState++
+                }
+            }
+        }
+    }
 
     if (!battleState.isActive) {
         // Combat Idle / Select Enemy screen
@@ -4152,97 +9324,164 @@ fun CombatScreen(
 
         // Active Battle Visual grid
         CyberCard(borderColor = QuantumNeonRed) {
-            Row(
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                    .offset { IntOffset(shakeOffset.x.roundToInt(), shakeOffset.y.roundToInt()) }
             ) {
-                // Player Column
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.weight(1f)
+                val containerWidth = maxWidth
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    PixelQuantumBabyRenderer(outfit = gameState.currentOutfit, modifier = Modifier.size(100.dp))
-                    Spacer(modifier = Modifier.height(4.dp))
+                    // Player Column
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        PixelQuantumBabyRenderer(outfit = gameState.currentOutfit, modifier = Modifier.size(100.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "QUANTUM BABY",
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = QuantumNeonPurple
+                        )
+                        Text(
+                            text = "${gameState.currentWeapon.displayName}",
+                            fontSize = 10.sp,
+                            color = QuantumGrayText
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        CyberProgressBar(progress = battleState.playerHp.toFloat() / battleState.playerMaxHp, label = "HEALTH", valueText = "${battleState.playerHp}/${battleState.playerMaxHp}", color = QuantumNeonGreen)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        CyberProgressBar(progress = battleState.playerMp.toFloat() / battleState.playerMaxMp, label = "MP CAPACITY", valueText = "${battleState.playerMp}/${battleState.playerMaxMp}", color = QuantumNeonBlue)
+                    }
+
+                    Spacer(modifier = Modifier.width(10.dp))
                     Text(
-                        text = "QUANTUM BABY",
-                        fontSize = 12.sp,
+                        text = "VS",
+                        fontSize = 18.sp,
                         fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold,
-                        color = QuantumNeonPurple
+                        color = Color.Gray,
+                        fontWeight = FontWeight.Bold
                     )
-                    Text(
-                        text = "${gameState.currentWeapon.displayName}",
-                        fontSize = 10.sp,
-                        color = QuantumGrayText
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    CyberProgressBar(progress = battleState.playerHp.toFloat() / battleState.playerMaxHp, label = "HEALTH", valueText = "${battleState.playerHp}/${battleState.playerMaxHp}", color = QuantumNeonGreen)
-                    Spacer(modifier = Modifier.height(4.dp))
-                    CyberProgressBar(progress = battleState.playerMp.toFloat() / battleState.playerMaxMp, label = "MP CAPACITY", valueText = "${battleState.playerMp}/${battleState.playerMaxMp}", color = QuantumNeonBlue)
+                    Spacer(modifier = Modifier.width(10.dp))
+
+                    // Enemy Column
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        // Retro monster drawing
+                        Box(
+                            modifier = Modifier
+                                .size(100.dp)
+                                .border(1.dp, QuantumNeonRed, RoundedCornerShape(8.dp))
+                                .background(QuantumDarkBg),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("👾", fontSize = 42.sp)
+                                Text(
+                                    text = "RESONATOR ACTIVE",
+                                    fontSize = 8.sp,
+                                    color = QuantumNeonRed,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = enemy.name.uppercase(),
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold,
+                            color = QuantumNeonRed
+                        )
+                        Text(
+                            text = "Mod: ${enemy.modName}",
+                            fontSize = 10.sp,
+                            color = QuantumGrayText
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        CyberProgressBar(progress = enemy.currentHp.toFloat() / enemy.maxHp, label = "HP", valueText = "${enemy.currentHp}/${enemy.maxHp}", color = QuantumNeonRed)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Vulnerable: ${enemy.vulnerability}",
+                            fontSize = 9.sp,
+                            color = QuantumNeonOrange,
+                            fontFamily = FontFamily.Monospace,
+                            textAlign = TextAlign.Center
+                        )
+                    }
                 }
 
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                    text = "VS",
-                    fontSize = 18.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = Color.Gray,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(modifier = Modifier.width(10.dp))
-
-                // Enemy Column
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.weight(1f)
-                ) {
-                    // Retro monster drawing
-                    Box(
-                        modifier = Modifier
-                            .size(100.dp)
-                            .border(1.dp, QuantumNeonRed, RoundedCornerShape(8.dp))
-                            .background(QuantumDarkBg),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("👾", fontSize = 42.sp)
-                            Text(
-                                text = "RESONATOR ACTIVE",
-                                fontSize = 8.sp,
-                                color = QuantumNeonRed,
-                                fontFamily = FontFamily.Monospace
+                // Dynamic Particle Canvas Overlay
+                Canvas(modifier = Modifier.matchParentSize()) {
+                    val unused = tickState // Read tickState to force draw path re-evaluation
+                    
+                    for (spark in sparkPool) {
+                        if (spark.active) {
+                            val posX = size.width * spark.x
+                            val posY = size.height * spark.y
+                            
+                            // Main Core Glow
+                            drawCircle(
+                                color = spark.color.copy(alpha = spark.life),
+                                radius = spark.radius,
+                                center = Offset(posX, posY)
+                            )
+                            // Radiant Ambient Aura
+                            drawCircle(
+                                color = spark.color.copy(alpha = spark.life * 0.35f),
+                                radius = spark.radius * 2.5f,
+                                center = Offset(posX, posY)
                             )
                         }
                     }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = enemy.name.uppercase(),
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold,
-                        color = QuantumNeonRed
-                    )
-                    Text(
-                        text = "Mod: ${enemy.modName}",
-                        fontSize = 10.sp,
-                        color = QuantumGrayText
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    CyberProgressBar(progress = enemy.currentHp.toFloat() / enemy.maxHp, label = "HP", valueText = "${enemy.currentHp}/${enemy.maxHp}", color = QuantumNeonRed)
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Vulnerable: ${enemy.vulnerability}",
-                        fontSize = 9.sp,
-                        color = QuantumNeonOrange,
-                        fontFamily = FontFamily.Monospace,
-                        textAlign = TextAlign.Center
-                    )
+                }
+
+                // Floating Damage Numbers Text Blocks
+                val unusedTick = tickState // Force recomposition/redraw of floaters
+                
+                for (floater in floaterPool) {
+                    if (floater.active) {
+                        val posX = containerWidth * floater.x - 30.dp
+                        val posY = 150.dp * floater.y
+                        Box(
+                            modifier = Modifier
+                                .offset(x = posX, y = posY)
+                                .graphicsLayer(
+                                    scaleX = floater.scale * (0.6f + floater.life * 0.4f),
+                                    scaleY = floater.scale * (0.6f + floater.life * 0.4f),
+                                    alpha = floater.life
+                                )
+                        ) {
+                            Text(
+                                text = floater.text,
+                                fontSize = 15.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = floater.color,
+                                modifier = Modifier
+                                    .background(Color.Black.copy(alpha = 0.75f), RoundedCornerShape(4.dp))
+                                    .border(1.dp, floater.color.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
                 }
             }
         }
+
+        // Tactician Radio Companion AI Simulator (Gameplay Polish)
+        TacticianRadioCompanionUi(viewModel = viewModel, gameState = gameState, battleState = battleState)
 
         // Terminal Log Window
         CyberCard(borderColor = Color.Gray) {
@@ -4268,7 +9507,7 @@ fun CombatScreen(
                             text = "> ${log.text}",
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,
-                            color = log.color,
+                            color = Color(log.color),
                             lineHeight = 14.sp,
                             modifier = Modifier.padding(vertical = 2.dp)
                         )
@@ -4354,8 +9593,7 @@ fun CombatScreen(
                     ) {
                         CyberButton(
                             onClick = {
-                                val logs = battleState.logs.toMutableList()
-                                logs.add(BattleLog("DEFEND: You raise magnetic arm deflectors! Enemy next strike mitigated by 50%.", true, QuantumNeonGreen))
+                                viewModel.injectCombatLog("DEFEND: You raise magnetic arm deflectors! Enemy next strike mitigated by 50%.", true, QuantumNeonGreen.value.toLong())
                                 viewModel.executePlayerSkill(ActiveSkill.PHASE_SHIELD)
                             },
                             text = "Defend",
@@ -4399,7 +9637,7 @@ fun CombatScreen(
                                     Card(
                                         modifier = Modifier
                                             .width(130.dp)
-                                            .border(1.dp, skill.color.copy(alpha = 0.5f))
+                                            .border(1.dp, Color(skill.color).copy(alpha = 0.5f))
                                             .clickable {
                                                 viewModel.executePlayerSkill(skill)
                                             },
@@ -4411,7 +9649,7 @@ fun CombatScreen(
                                                 fontSize = 11.sp,
                                                 fontFamily = FontFamily.Monospace,
                                                 fontWeight = FontWeight.Bold,
-                                                color = skill.color
+                                                color = Color(skill.color)
                                             )
                                             Text(
                                                 text = "${skill.mpCost} MP",
@@ -4442,15 +9680,34 @@ fun CombatScreen(
 fun DeusExAiScreen(
     viewModel: GameViewModel
 ) {
+    var activeTab by remember { mutableStateOf(1) } // Default to TACTICAL RADIO console as requested!
     var complexPrompt by remember { mutableStateOf("Synthesize an optimal build combining Cranial Memory Expansion, Torso Bio-Reactor, and Quantum Capacitor. Analyze mathematical scaling against Null Colossus.") }
     var searchGroundingPrompt by remember { mutableStateOf("factions of the quantum frontier in Solis") }
 
-    val thinkingText by viewModel.thinkingText.collectAsState()
-    val isThinking by viewModel.isThinking.collectAsState()
+    val thinkingText by viewModel.thinkingText.collectAsStateWithLifecycle()
+    val isThinking by viewModel.isThinking.collectAsStateWithLifecycle()
 
-    val searchText by viewModel.searchText.collectAsState()
-    val isSearching by viewModel.isSearching.collectAsState()
-    val searchSources by viewModel.searchSources.collectAsState()
+    val searchText by viewModel.searchText.collectAsStateWithLifecycle()
+    val isSearching by viewModel.isSearching.collectAsStateWithLifecycle()
+    val searchSources by viewModel.searchSources.collectAsStateWithLifecycle()
+
+    // Radio States
+    val radioLog by viewModel.radioTransmissionLog.collectAsStateWithLifecycle()
+    val isTransmitting by viewModel.isTransmitting.collectAsStateWithLifecycle()
+    var activeFrequency by remember { mutableStateOf(144.8f) }
+    var radioCustomMessage by remember { mutableStateOf("") }
+
+    // Wave Phase Animation
+    val infiniteTransition = rememberInfiniteTransition("wave_tuner")
+    val phase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 100f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(8000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "phase"
+    )
 
     LazyColumn(
         modifier = Modifier
@@ -4467,7 +9724,7 @@ fun DeusExAiScreen(
                 color = QuantumNeonPurple
             )
             Text(
-                text = "Direct interface to Solis's centralized parallel timeline supercomputer networks. Run deep reasoning or scan the active Infoband.",
+                text = "Direct interface to Solis's centralized parallel timeline networks, tactical frequencies, and deep reasoning nodes.",
                 color = QuantumGrayText,
                 fontSize = 13.sp,
                 lineHeight = 18.sp
@@ -4475,182 +9732,595 @@ fun DeusExAiScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        // Terminal 1: High Thinking Mode
+        // Sub-Console Selector Tabs
         item {
-            CyberCard(borderColor = QuantumNeonPurple) {
-                Text(
-                    text = "CONSOLE 01: COGNITIVE HIGH-THINKING ENGINE",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    color = QuantumNeonPurple
-                )
-                Text(
-                    text = "Runs parallel calculations on 'gemini-3.1-pro-preview' to synthesize build coordinates, synergies, and tactical options.",
-                    color = QuantumGrayText,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(vertical = 4.dp)
-                )
-
-                OutlinedTextField(
-                    value = complexPrompt,
-                    onValueChange = { complexPrompt = it },
-                    textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = QuantumLightText),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = QuantumDarkBg,
-                        unfocusedContainerColor = QuantumDarkBg,
-                        focusedTextColor = QuantumLightText,
-                        unfocusedTextColor = QuantumLightText,
-                        cursorColor = QuantumNeonPurple
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(110.dp)
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                CyberButton(
-                    onClick = { viewModel.analyzeQuantumSynergy(complexPrompt) },
-                    text = if (isThinking) "Calculating..." else "Overclock High Thinking",
-                    color = QuantumNeonPurple,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !isThinking
-                )
-
-                if (isThinking) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    LinearProgressIndicator(
-                        modifier = Modifier.fillMaxWidth(),
-                        color = QuantumNeonPurple,
-                        trackColor = QuantumBorder
-                    )
-                }
-
-                if (thinkingText.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "SOLVED REASONING LOG:",
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = QuantumNeonPurple,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.Black.copy(alpha = 0.3f))
+                    .border(1.dp, QuantumBorder, RoundedCornerShape(4.dp))
+                    .padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                listOf("DEUS COGNITIVE CORE", "TACTICAL RADIO CONSOLE").forEachIndexed { index, label ->
                     Box(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color.Black.copy(alpha = 0.4f))
-                            .border(1.dp, QuantumBorder)
-                            .padding(10.dp)
+                            .weight(1f)
+                            .background(
+                                color = if (activeTab == index) QuantumNeonPurple.copy(alpha = 0.2f) else Color.Transparent,
+                                shape = RoundedCornerShape(2.dp)
+                            )
+                            .border(
+                                width = 1.dp,
+                                color = if (activeTab == index) QuantumNeonPurple else Color.Transparent,
+                                shape = RoundedCornerShape(2.dp)
+                            )
+                            .clickable { activeTab = index }
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = thinkingText,
-                            fontSize = 12.sp,
+                            text = label,
+                            color = if (activeTab == index) Color.White else Color.Gray,
+                            fontSize = 10.5.sp,
                             fontFamily = FontFamily.Monospace,
-                            color = QuantumTerminalGreen,
-                            lineHeight = 16.sp
+                            fontWeight = FontWeight.Bold
                         )
                     }
                 }
             }
         }
 
-        // Terminal 2: Search Grounding Terminal
-        item {
-            CyberCard(borderColor = QuantumNeonBlue) {
-                Text(
-                    text = "CONSOLE 02: SOLIS INFOBAND SEARCH GATEWAY",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    color = QuantumNeonBlue
-                )
-                Text(
-                    text = "Scans parallel networks using Google Search Grounding ('gemini-3.5-flash') to pull down accurate facts or live-lore feeds.",
-                    color = QuantumGrayText,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(vertical = 4.dp)
-                )
-
-                OutlinedTextField(
-                    value = searchGroundingPrompt,
-                    onValueChange = { searchGroundingPrompt = it },
-                    textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = QuantumLightText),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = QuantumDarkBg,
-                        unfocusedContainerColor = QuantumDarkBg,
-                        focusedTextColor = QuantumLightText,
-                        unfocusedTextColor = QuantumLightText,
-                        cursorColor = QuantumNeonBlue
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                CyberButton(
-                    onClick = { viewModel.searchSolisInfoband(searchGroundingPrompt) },
-                    text = if (isSearching) "Scanning..." else "Search Solis Network",
-                    color = QuantumNeonBlue,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !isSearching
-                )
-
-                if (isSearching) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    LinearProgressIndicator(
-                        modifier = Modifier.fillMaxWidth(),
-                        color = QuantumNeonBlue,
-                        trackColor = QuantumBorder
-                    )
-                }
-
-                if (searchText.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(12.dp))
+        if (activeTab == 0) {
+            // ==================== DEUS CENTRAL CORE ====================
+            // Terminal 1: High Thinking Mode
+            item {
+                CyberCard(borderColor = QuantumNeonPurple) {
                     Text(
-                        text = "SOLIS COORD INTELLIGENCE:",
-                        fontSize = 10.sp,
+                        text = "CONSOLE 01: COGNITIVE HIGH-THINKING ENGINE",
+                        fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
-                        color = QuantumNeonBlue,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        color = QuantumNeonPurple
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Box(
+                    Text(
+                        text = "Runs parallel calculations on 'gemini-3.1-pro-preview' to synthesize build coordinates, synergies, and tactical options.",
+                        color = QuantumGrayText,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
+
+                    OutlinedTextField(
+                        value = complexPrompt,
+                        onValueChange = { complexPrompt = it },
+                        textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = QuantumLightText),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = QuantumDarkBg,
+                            unfocusedContainerColor = QuantumDarkBg,
+                            focusedTextColor = QuantumLightText,
+                            unfocusedTextColor = QuantumLightText,
+                            cursorColor = QuantumNeonPurple
+                        ),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(Color.Black.copy(alpha = 0.4f))
-                            .border(1.dp, QuantumBorder)
-                            .padding(10.dp)
-                    ) {
-                        Text(
-                            text = searchText,
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = QuantumLightText,
-                            lineHeight = 16.sp
+                            .height(110.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    CyberButton(
+                        onClick = { viewModel.analyzeQuantumSynergy(complexPrompt) },
+                        text = if (isThinking) "Calculating..." else "Overclock High Thinking",
+                        color = QuantumNeonPurple,
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isThinking
+                    )
+
+                    if (isThinking) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = QuantumNeonPurple,
+                            trackColor = QuantumBorder
                         )
                     }
 
-                    if (searchSources.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(10.dp))
+                    if (thinkingText.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "SECURE VERIFIED SOURCES:",
+                            text = "SOLVED REASONING LOG:",
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace,
-                            color = QuantumNeonGreen,
+                            color = QuantumNeonPurple,
                             fontWeight = FontWeight.Bold
                         )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        searchSources.forEach { source ->
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color.Black.copy(alpha = 0.4f))
+                                .border(1.dp, QuantumBorder)
+                                .padding(10.dp)
+                        ) {
                             Text(
-                                text = "• [${source.title ?: "Solis Node"}] -> ${source.uri}",
+                                text = thinkingText,
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = QuantumTerminalGreen,
+                                lineHeight = 16.sp
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Terminal 2: Search Grounding Terminal
+            item {
+                CyberCard(borderColor = QuantumNeonBlue) {
+                    Text(
+                        text = "CONSOLE 02: SOLIS INFOBAND SEARCH GATEWAY",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = QuantumNeonBlue
+                    )
+                    Text(
+                        text = "Scans parallel networks using Google Search Grounding ('gemini-3.5-flash') to pull down accurate facts or live-lore feeds.",
+                        color = QuantumGrayText,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
+
+                    OutlinedTextField(
+                        value = searchGroundingPrompt,
+                        onValueChange = { searchGroundingPrompt = it },
+                        textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = QuantumLightText),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = QuantumDarkBg,
+                            unfocusedContainerColor = QuantumDarkBg,
+                            focusedTextColor = QuantumLightText,
+                            unfocusedTextColor = QuantumLightText,
+                            cursorColor = QuantumNeonBlue
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    CyberButton(
+                        onClick = { viewModel.searchSolisInfoband(searchGroundingPrompt) },
+                        text = if (isSearching) "Scanning..." else "Search Solis Network",
+                        color = QuantumNeonBlue,
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isSearching
+                    )
+
+                    if (isSearching) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = QuantumNeonBlue,
+                            trackColor = QuantumBorder
+                        )
+                    }
+
+                    if (searchText.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "SOLIS COORD INTELLIGENCE:",
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = QuantumNeonBlue,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color.Black.copy(alpha = 0.4f))
+                                .border(1.dp, QuantumBorder)
+                                .padding(10.dp)
+                        ) {
+                            Text(
+                                text = searchText,
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = QuantumLightText,
+                                lineHeight = 16.sp
+                            )
+                        }
+
+                        if (searchSources.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "SECURE VERIFIED SOURCES:",
                                 fontSize = 10.sp,
                                 fontFamily = FontFamily.Monospace,
                                 color = QuantumNeonGreen,
-                                lineHeight = 14.sp,
-                                modifier = Modifier.padding(vertical = 2.dp)
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            searchSources.forEach { source ->
+                                Text(
+                                    text = "• [${source.title ?: "Solis Node"}] -> ${source.uri}",
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = QuantumNeonGreen,
+                                    lineHeight = 14.sp,
+                                    modifier = Modifier.padding(vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // ==================== TACTICAL RADIO CONSOLE ====================
+            item {
+                val freqColor = when (activeFrequency) {
+                    144.8f -> QuantumNeonBlue
+                    98.2f -> QuantumNeonOrange
+                    404.0f -> QuantumNeonPurple
+                    else -> Color.White
+                }
+                val statusText = when (activeFrequency) {
+                    144.8f -> "SECURE COLD-MILITARY LINK"
+                    98.2f -> "DECENTRALIZED FREEDOM WAVE"
+                    404.0f -> "DEEP SPACE CORRUPT COGNITIVE HUB"
+                    else -> "SIGNAL NOISY"
+                }
+
+                CyberCard(borderColor = freqColor) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = "📻 TACTICAL CO-OP RADIO TRANSMITTER",
+                                    fontSize = 12.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    color = freqColor
+                                )
+                                Text(
+                                    text = "TUNED: ${activeFrequency} MHz • $statusText",
+                                    fontSize = 9.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = QuantumGrayText
+                                )
+                            }
+                            IconButton(
+                                onClick = { viewModel.clearRadioLogs() },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Text("🗑️", fontSize = 12.sp)
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Interactive Frequency Selector Panel (Tuning Station)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(
+                                Triple(144.8f, "ENLIGHT HQ", QuantumNeonBlue),
+                                Triple(98.2f, "PUNK WIRE", QuantumNeonOrange),
+                                Triple(404.0f, "SPECTRE AI", QuantumNeonPurple)
+                            ).forEach { (freq, label, color) ->
+                                val selected = activeFrequency == freq
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .background(if (selected) color.copy(alpha = 0.15f) else Color.Black)
+                                        .border(1.dp, if (selected) color else QuantumBorder)
+                                        .clickable { activeFrequency = freq }
+                                        .padding(vertical = 8.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Text(
+                                            text = label,
+                                            color = if (selected) color else Color.Gray,
+                                            fontSize = 9.5.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = "${freq}MHz",
+                                            color = if (selected) Color.White else Color.DarkGray,
+                                            fontSize = 8.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Live Waveform Tuning visualizer Canvas
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(64.dp)
+                                .background(Color.Black.copy(alpha = 0.6f))
+                                .border(1.dp, freqColor.copy(alpha = 0.3f), RoundedCornerShape(4.dp))
+                        ) {
+                            val width = size.width
+                            val height = size.height
+                            val midY = height / 2f
+                            val path = Path()
+                            path.moveTo(0f, midY)
+
+                            val pointsCount = 100
+                            for (i in 0..pointsCount) {
+                                val x = (i.toFloat() / pointsCount) * width
+                                val y = when (activeFrequency) {
+                                    144.8f -> midY + sin((i * 0.35f) + phase) * 20f * cos(i * 0.04f)
+                                    98.2f -> {
+                                        // Jagged noisy technopunk spike
+                                        val noise = if (i % 4 == 0) 10f else if (i % 4 == 2) -10f else 0f
+                                        midY + sin((i * 0.75f) + (phase * 1.5f)) * 16f + noise
+                                    }
+                                    404.0f -> {
+                                        // Slow cryptic pulsing waves
+                                        midY + sin((i * 0.12f) + (phase * 0.4f)) * 12f * sin((i * 0.06f) + (phase * 0.2f)) * 18f
+                                    }
+                                    else -> midY + sin((i * 0.3f) + phase) * 10f
+                                }
+                                path.lineTo(x, y)
+                            }
+
+                            drawPath(
+                                path = path,
+                                color = freqColor,
+                                style = Stroke(width = 1.5.dp.toPx())
+                            )
+
+                            // Grid scan lines
+                            val gridCount = 10
+                            for (g in 1..gridCount) {
+                                val lineX = (g.toFloat() / gridCount) * width
+                                drawLine(
+                                    color = freqColor.copy(alpha = 0.08f),
+                                    start = Offset(lineX, 0f),
+                                    end = Offset(lineX, height),
+                                    strokeWidth = 1f
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Chat Feed Log
+            item {
+                Text(
+                    text = "DECRYPTED TRANSLATIONS FEED",
+                    color = QuantumGrayText,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            if (radioLog.isEmpty()) {
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color.Black.copy(alpha = 0.3f))
+                            .border(1.dp, QuantumBorder.copy(alpha = 0.4f))
+                            .padding(24.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "[ NO ENCRYPTED TRANSMISSIONS RECORDED IN THIS SECTOR ]\nUse fast-pings below or transmit a custom distress coordinate.",
+                            color = Color.DarkGray,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
+            } else {
+                items(radioLog) { msg ->
+                    val bubbleBorder = when (msg.frequency) {
+                        144.8f -> QuantumNeonBlue
+                        98.2f -> QuantumNeonOrange
+                        404.0f -> QuantumNeonPurple
+                        else -> QuantumBorder
+                    }
+                    val isUser = msg.sender.contains("DIRECTOR")
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(0.9f)
+                                .background(if (isUser) Color.Black.copy(alpha = 0.4f) else Color.DarkGray.copy(alpha = 0.1f))
+                                .border(1.dp, if (isUser) QuantumNeonGreen.copy(alpha = 0.5f) else bubbleBorder.copy(alpha = 0.7f), RoundedCornerShape(4.dp))
+                                .padding(10.dp)
+                        ) {
+                            Column {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = msg.sender,
+                                        color = if (isUser) QuantumNeonGreen else bubbleBorder,
+                                        fontSize = 9.5.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = msg.timestamp,
+                                        color = Color.DarkGray,
+                                        fontSize = 8.sp,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = msg.text,
+                                    color = QuantumLightText,
+                                    fontSize = 12.sp,
+                                    lineHeight = 16.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (isTransmitting) {
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color.Black)
+                            .border(1.dp, QuantumNeonPurple.copy(alpha = 0.3f))
+                            .padding(10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            color = QuantumNeonPurple,
+                            strokeWidth = 2.dp
+                        )
+                        Text(
+                            text = "ESTABLISHING ENCRYPTED SIGNAL LINK... PARALLEL PROJECTION MODEL ACTIVE",
+                            color = QuantumNeonPurple,
+                            fontSize = 9.5.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            // Quick Preset Pings Panel
+            item {
+                Text(
+                    text = "RAPID FIELD FAST-PINGS",
+                    color = QuantumGrayText,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            item {
+                val presets = listOf(
+                    "Plan tactical formation around localized heavy Null Sentinel shields.",
+                    "Is there a safe limit to dynamic neural overclocking algorithms?",
+                    "Deploy EMP backup matrix coordinates to counter elite drone patrols.",
+                    "Report cosmic anomalies detected near Solis boundary lines."
+                )
+
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    presets.forEach { preset ->
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color.Black)
+                                .border(1.dp, QuantumBorder.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+                                .clickable(enabled = !isTransmitting) {
+                                    viewModel.transmitRadioMessage(activeFrequency, preset)
+                                }
+                                .padding(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = preset,
+                                    color = QuantumLightText,
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "PING 📡",
+                                    color = QuantumNeonGreen,
+                                    fontSize = 8.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Custom Transmitter Input
+            item {
+                CyberCard(borderColor = QuantumNeonGreen) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = "💬 BROADCAST CUSTOM FREQUENCY SIGNATURE",
+                            color = QuantumNeonGreen,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedTextField(
+                                value = radioCustomMessage,
+                                onValueChange = { radioCustomMessage = it },
+                                placeholder = {
+                                    Text(
+                                        text = "Input custom frequency signature log...",
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = Color.DarkGray
+                                    )
+                                },
+                                textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = QuantumLightText),
+                                colors = TextFieldDefaults.colors(
+                                    focusedContainerColor = QuantumDarkBg,
+                                    unfocusedContainerColor = QuantumDarkBg,
+                                    focusedTextColor = QuantumLightText,
+                                    unfocusedTextColor = QuantumLightText,
+                                    cursorColor = QuantumNeonGreen
+                                ),
+                                modifier = Modifier.weight(1f),
+                                maxLines = 2
+                            )
+
+                            CyberButton(
+                                onClick = {
+                                    if (radioCustomMessage.isNotBlank()) {
+                                        viewModel.transmitRadioMessage(activeFrequency, radioCustomMessage)
+                                        radioCustomMessage = ""
+                                    }
+                                },
+                                text = "SEND",
+                                color = QuantumNeonGreen,
+                                enabled = !isTransmitting && radioCustomMessage.isNotBlank(),
+                                modifier = Modifier.width(72.dp)
                             )
                         }
                     }
@@ -5170,20 +10840,22 @@ func _create_particles() -> void:
                         if (hasEnoughResources) {
                             val buildingId = System.currentTimeMillis()
                             viewModel.deployArchitecture(
-                                faction = selectedBuilding.faction,
-                                creditsCost = selectedBuilding.costCredits,
-                                nanitesCost = selectedBuilding.costNanites,
-                                xpGain = 150,
-                                repIncrease = 50,
-                                structure = DeployedStructure(
-                                    id = buildingId,
-                                    type = selectedBuilding.renderType,
-                                    name = selectedBuilding.name,
-                                    factionName = selectedBuilding.faction.name,
-                                    biomeName = selectedBiome.name,
-                                    x = playerX,
-                                    y = playerY,
-                                    colorVal = selectedBuilding.color.value.toLong()
+                                selectedBuilding.faction,
+                                selectedBuilding.costCredits,
+                                selectedBuilding.costNanites,
+                                150,
+                                50,
+                                DeployedStructure(
+                                    buildingId,
+                                    selectedBuilding.renderType,
+                                    selectedBuilding.name,
+                                    selectedBuilding.faction.name,
+                                    selectedBiome.name,
+                                    playerX,
+                                    playerY,
+                                    selectedBuilding.color.value.toLong(),
+                                    false,
+                                    1
                                 )
                             )
 
@@ -5330,7 +11002,7 @@ func _create_particles() -> void:
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                     CyberButton(
                                         onClick = {
-                                            viewModel.addResources(credits = yield, nanites = nYield, xp = 30)
+                                            viewModel.addResources(yield, nYield, 30)
                                             damageNumbers.add(
                                                 IsoDamageNumber(
                                                     id = System.nanoTime(),
@@ -6425,20 +12097,22 @@ func trigger_exhaust_steam() -> void:
 
                             val obstacleId = System.currentTimeMillis()
                             viewModel.deployArchitecture(
-                                faction = chosenFaction,
-                                creditsCost = finalCostCredits,
-                                nanitesCost = finalCostNanites,
-                                xpGain = 200,
-                                repIncrease = 100,
-                                structure = DeployedStructure(
-                                    id = obstacleId,
-                                    type = "INTERNAL_MODULE",
-                                    name = "${selectedRoom.name} Module",
-                                    factionName = chosenFaction.name,
-                                    biomeName = selectedBiome.name,
-                                    x = playerX,
-                                    y = playerY,
-                                    colorVal = finalNeonColor.value.toLong()
+                                chosenFaction,
+                                finalCostCredits,
+                                finalCostNanites,
+                                200,
+                                100,
+                                DeployedStructure(
+                                    obstacleId,
+                                    "INTERNAL_MODULE",
+                                    "${selectedRoom.name} Module",
+                                    chosenFaction.name,
+                                    selectedBiome.name,
+                                    playerX,
+                                    playerY,
+                                    finalNeonColor.value.toLong(),
+                                    false,
+                                    1
                                 )
                             )
 
@@ -6604,7 +12278,7 @@ func trigger_exhaust_steam() -> void:
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                     CyberButton(
                                         onClick = {
-                                            viewModel.addResources(credits = yield, nanites = nYield, xp = 30)
+                                            viewModel.addResources(yield, nYield, 30)
                                             damageNumbers.add(
                                                 IsoDamageNumber(
                                                     id = System.nanoTime(),
@@ -7087,20 +12761,22 @@ func interact() -> void:
                         if (hasResources) {
                             val propId = System.currentTimeMillis()
                             viewModel.deployArchitecture(
-                                faction = com.example.game.models.Faction.AURELIAN_ORDER,
-                                creditsCost = selectedProp.costCredits,
-                                nanitesCost = selectedProp.costNanites,
-                                xpGain = 100,
-                                repIncrease = 20,
-                                structure = DeployedStructure(
-                                    id = propId,
-                                    type = selectedProp.renderType,
-                                    name = selectedProp.name,
-                                    factionName = "Aurelian Order",
-                                    biomeName = selectedBiome.name,
-                                    x = playerX,
-                                    y = playerY,
-                                    colorVal = selectedProp.defaultColor.value.toLong()
+                                com.example.game.models.Faction.AURELIAN_ORDER,
+                                selectedProp.costCredits,
+                                selectedProp.costNanites,
+                                100,
+                                20,
+                                DeployedStructure(
+                                    propId,
+                                    selectedProp.renderType,
+                                    selectedProp.name,
+                                    "Aurelian Order",
+                                    selectedBiome.name,
+                                    playerX,
+                                    playerY,
+                                    selectedProp.defaultColor.value.toLong(),
+                                    false,
+                                    1
                                 )
                             )
                             
@@ -7157,8 +12833,11 @@ func interact() -> void:
             }
         }
 
-        // Section 5: Godot 4.x GDScript compiler panel
+        // Section 5: Kotlin & Compose compiler panel (with toggle tab for GDScript)
         item {
+            var showKotlinCode by remember { mutableStateOf(true) }
+            val codeToDisplay = if (showKotlinCode) translateGdScriptToKotlin(selectedProp.gdscriptCode) else selectedProp.gdscriptCode
+            
             CyberCard(borderColor = QuantumNeonOrange) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -7166,29 +12845,43 @@ func interact() -> void:
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "🤖 GODOT 4.X GDSCRIPT COMPILER",
+                        text = if (showKotlinCode) "🤖 KOTLIN & COMPOSE CONTROLLER" else "📜 LEGACY GDSCRIPT CONTROLLER",
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
                         color = QuantumNeonOrange
                     )
                     
-                    CyberButton(
-                        onClick = {
-                            clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(selectedProp.gdscriptCode))
-                            copiedMessageVisible = true
-                        },
-                        text = "Copy Code",
-                        color = QuantumNeonOrange,
-                        modifier = Modifier.height(28.dp)
-                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CyberButton(
+                            onClick = { showKotlinCode = !showKotlinCode },
+                            text = if (showKotlinCode) "Show GDScript" else "Show Kotlin",
+                            color = QuantumNeonOrange.copy(alpha = 0.8f),
+                            modifier = Modifier.height(28.dp)
+                        )
+                        CyberButton(
+                            onClick = {
+                                clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(codeToDisplay))
+                                copiedMessageVisible = true
+                            },
+                            text = "Copy",
+                            color = QuantumNeonOrange,
+                            modifier = Modifier.height(28.dp)
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "• Recommended Node: ${selectedProp.godotNode}\n" +
-                           "• Inspector Properties: ${selectedProp.godotProperties}\n" +
-                           "• High-End mobile optimizations fully verified.",
+                    text = if (showKotlinCode) {
+                        "• Primary Component: ${getComposeComponentForNode(selectedProp.godotNode)}\n" +
+                        "• Modifiers & Properties: ${selectedProp.godotProperties}\n" +
+                        "• High-End mobile Compose rendering optimized."
+                    } else {
+                        "• Recommended Node: ${selectedProp.godotNode}\n" +
+                        "• Inspector Properties: ${selectedProp.godotProperties}\n" +
+                        "• Legacy Godot 4.x physics ticks verified."
+                    },
                     fontSize = 9.sp,
                     fontFamily = FontFamily.Monospace,
                     color = QuantumGrayText,
@@ -7198,7 +12891,7 @@ func interact() -> void:
                 if (copiedMessageVisible) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "✓ GDSCRIPT COPIED TO SYSTEM CLIPBOARD!",
+                        text = if (showKotlinCode) "✓ KOTLIN CONTROLLER COPIED TO SYSTEM CLIPBOARD!" else "✓ GDSCRIPT COPIED TO SYSTEM CLIPBOARD!",
                         color = QuantumNeonGreen,
                         fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace,
@@ -7219,7 +12912,7 @@ func interact() -> void:
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
                         item {
                             Text(
-                                text = selectedProp.gdscriptCode,
+                                text = codeToDisplay,
                                 color = QuantumTerminalGreen,
                                 fontSize = 10.sp,
                                 fontFamily = FontFamily.Monospace,
@@ -7287,7 +12980,7 @@ func interact() -> void:
                                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                     CyberButton(
                                         onClick = {
-                                            viewModel.addResources(credits = bonusCrd, nanites = bonusNnt, xp = 20)
+                                            viewModel.addResources(bonusCrd, bonusNnt, 20)
                                             damageNumbers.add(
                                                 IsoDamageNumber(
                                                     id = System.nanoTime(),
@@ -8136,22 +13829,22 @@ func _pulse_radar_animation() -> void:
                                     val randomYOffset = (Math.random() * 80 - 40).toFloat()
                                     val chosenFaction = if (selectedFaction == "Enlighteners") com.example.game.models.Faction.AURELIAN_ORDER else com.example.game.models.Faction.EMBERPACT
                                     viewModel.deployArchitecture(
-                                        faction = chosenFaction,
-                                        creditsCost = selectedNpc.costCredits,
-                                        nanitesCost = selectedNpc.costNanites,
-                                        xpGain = 120,
-                                        repIncrease = 30,
-                                        structure = DeployedStructure(
-                                            id = System.nanoTime(),
-                                            type = selectedNpc.renderType,
-                                            name = customNpcName,
-                                            factionName = selectedFaction,
-                                            biomeName = selectedBiome.name,
-                                            x = playerX + randomXOffset,
-                                            y = playerY + randomYOffset,
-                                            colorVal = selectedNpc.defaultColor.value.toLong(),
-                                            isUpgraded = false,
-                                            level = 1
+                                        chosenFaction,
+                                        selectedNpc.costCredits,
+                                        selectedNpc.costNanites,
+                                        120,
+                                        30,
+                                        DeployedStructure(
+                                            System.nanoTime(),
+                                            selectedNpc.renderType,
+                                            customNpcName,
+                                            selectedFaction,
+                                            selectedBiome.name,
+                                            playerX + randomXOffset,
+                                            playerY + randomYOffset,
+                                            selectedNpc.defaultColor.value.toLong(),
+                                            false,
+                                            1
                                         )
                                     )
                                     // Visual effect
@@ -8208,34 +13901,65 @@ func _pulse_radar_animation() -> void:
             }
         }
 
-        // SECTION 3: Godot 4.x / GDScript integration manual (Step-by-step for non-coders)
+        // SECTION 3: Kotlin & Compose integration manual (Step-by-step for non-coders)
         item {
+            var showKotlinCode by remember { mutableStateOf(true) }
+            val codeToDisplay = if (showKotlinCode) translateGdScriptToKotlin(selectedNpc.gdscriptCode) else selectedNpc.gdscriptCode
+            
             CyberCard(borderColor = QuantumBorder) {
-                Text(
-                    text = "🎮 GODOT 4.X ENGINE INTEGRATION GUIDE",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    color = QuantumNeonOrange
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (showKotlinCode) "📱 JETPACK COMPOSE INTEGRATION" else "🎮 GODOT 4.X ENGINE INTEGRATION",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = QuantumNeonOrange
+                    )
+                    
+                    CyberButton(
+                        onClick = { showKotlinCode = !showKotlinCode },
+                        text = if (showKotlinCode) "Show GDScript" else "Show Kotlin",
+                        color = QuantumNeonOrange.copy(alpha = 0.8f),
+                        modifier = Modifier.height(24.dp)
+                    )
+                }
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "Learn how to import and attach this complete specialist script to your Godot Engine 2D Isometric playground.",
+                    text = if (showKotlinCode) {
+                        "Learn how to import and instantiate this interactive Kotlin controller inside your high-performance Jetpack Compose interface."
+                    } else {
+                        "Learn how to import and attach this complete specialist script to your Godot Engine 2D Isometric playground."
+                    },
                     fontSize = 9.sp,
                     fontFamily = FontFamily.Monospace,
                     color = QuantumLightText.copy(alpha = 0.8f)
                 )
                 Spacer(modifier = Modifier.height(10.dp))
 
-                val integrationSteps = listOf(
-                    "Create a new Node in your scene with type:  [ ${selectedNpc.godotNode} ].",
-                    "Add a Sprite2D child node and configure its texture to point to the 32x32px division sprite sheet.",
-                    "Add a CollisionShape2D child node with suitable boundary shape (Circle or Capsule).",
-                    "In the Inspector, set collision layers:  [ ${selectedNpc.godotProperties} ].",
-                    "Right-click the main [ ${selectedNpc.godotNode} ] node, click 'Attach Script', and create a new GDScript file.",
-                    "Copy the complete error-free controller code from the compiler below and paste it directly into your script."
-                )
+                val integrationSteps = if (showKotlinCode) {
+                    listOf(
+                        "Define a dedicated controller class or Composable structure of type [ ${getComposeComponentForNode(selectedNpc.godotNode)} ].",
+                        "Configure standard Modifiers including custom positioning, layout sizing, and touch targets.",
+                        "Inject state flows using StateFlow or MutableState to enable real-time tactical updates.",
+                        "Set up dynamic interaction gestures using PointerInput modifiers: [ ${selectedNpc.godotProperties} ].",
+                        "Instantiate this custom controller within your primary screen scaffold or sub-layout.",
+                        "Copy the fully pre-allocated Kotlin Controller source code from the compiler below."
+                    )
+                } else {
+                    listOf(
+                        "Create a new Node in your scene with type:  [ ${selectedNpc.godotNode} ].",
+                        "Add a Sprite2D child node and configure its texture to point to the 32x32px division sprite sheet.",
+                        "Add a CollisionShape2D child node with suitable boundary shape (Circle or Capsule).",
+                        "In the Inspector, set collision layers:  [ ${selectedNpc.godotProperties} ].",
+                        "Right-click the main [ ${selectedNpc.godotNode} ] node, click 'Attach Script', and create a new GDScript file.",
+                        "Copy the complete error-free controller code from the compiler below and paste it directly into your script."
+                    )
+                }
 
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     integrationSteps.forEachIndexed { idx, step ->
@@ -8248,8 +13972,11 @@ func _pulse_radar_animation() -> void:
             }
         }
 
-        // SECTION 4: Copy Code & GDScript compiler tab
+        // SECTION 4: Copy Code & Kotlin/GDScript compiler tab
         item {
+            var showKotlinCode by remember { mutableStateOf(true) }
+            val codeToDisplay = if (showKotlinCode) translateGdScriptToKotlin(selectedNpc.gdscriptCode) else selectedNpc.gdscriptCode
+            
             CyberCard(borderColor = QuantumNeonPurple) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -8257,30 +13984,38 @@ func _pulse_radar_animation() -> void:
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "📜 GDSCRIPT CONTROLLER COMPILER",
+                        text = if (showKotlinCode) "🤖 KOTLIN CONTROLLER ARCHITECT" else "📜 LEGACY GDSCRIPT CONTROLLER",
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
                         color = QuantumNeonPurple
                     )
                     
-                    CyberButton(
-                        onClick = {
-                            clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(selectedNpc.gdscriptCode))
-                            damageNumbers.add(
-                                IsoDamageNumber(
-                                    id = System.nanoTime(),
-                                    text = "GDScript copied to clipboard!",
-                                    x = playerX,
-                                    y = playerY - 30f,
-                                    color = QuantumNeonPurple
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CyberButton(
+                            onClick = { showKotlinCode = !showKotlinCode },
+                            text = if (showKotlinCode) "Show GDScript" else "Show Kotlin",
+                            color = QuantumNeonPurple.copy(alpha = 0.8f),
+                            modifier = Modifier.height(26.dp)
+                        )
+                        CyberButton(
+                            onClick = {
+                                clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(codeToDisplay))
+                                damageNumbers.add(
+                                    IsoDamageNumber(
+                                        id = System.nanoTime(),
+                                        text = if (showKotlinCode) "Kotlin copied!" else "GDScript copied!",
+                                        x = playerX,
+                                        y = playerY - 30f,
+                                        color = QuantumNeonPurple
+                                    )
                                 )
-                            )
-                        },
-                        text = "Copy Script",
-                        color = QuantumNeonPurple,
-                        modifier = Modifier.height(26.dp)
-                    )
+                            },
+                            text = "Copy",
+                            color = QuantumNeonPurple,
+                            modifier = Modifier.height(26.dp)
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
 
@@ -8292,7 +14027,7 @@ func _pulse_radar_animation() -> void:
                         .padding(8.dp)
                 ) {
                     Text(
-                        text = selectedNpc.gdscriptCode,
+                        text = codeToDisplay,
                         color = Color(0xFFC5CBD3),
                         fontSize = 8.5.sp,
                         fontFamily = FontFamily.Monospace,
@@ -8369,7 +14104,7 @@ func _pulse_radar_animation() -> void:
                                     // CONSULT BUTTON
                                     CyberButton(
                                         onClick = {
-                                            viewModel.addResources(credits = yieldCredits, nanites = yieldNanites, xp = 20)
+                                            viewModel.addResources(yieldCredits, yieldNanites, 20)
                                             val loreDialog = when (blueprint.renderType) {
                                                 "NPC_ENGINEERING" -> "ENGINEER: 'Hulls stabilized. Sector power grids aligned at 104% efficiency.'"
                                                 "NPC_COMMERCE" -> "MERCHANT: 'Credits streams encrypted. Black market transaction logs scrubbed.'"
@@ -8439,7 +14174,7 @@ fun CompanionsView(
     viewModel: GameViewModel,
     gameState: GameState
 ) {
-    val activeCompanionName by viewModel.activeCompanionName.collectAsState()
+    val activeCompanionName by viewModel.activeCompanionName.collectAsStateWithLifecycle()
     var selectedCompanionName by remember { mutableStateOf("ATOM") }
     var showGearDialogForSlot by remember { mutableStateOf<String?>(null) }
     var activeGodotTab by remember { mutableStateOf(0) } // 0 = Node Construction, 1 = GDScript Code, 2 = Optimization Guide
@@ -8450,19 +14185,19 @@ fun CompanionsView(
 
     val selectedCompanion = companionsList.find { it.name == selectedCompanionName }
         ?: CompanionRecord(
-            name = "ATOM",
-            role = "Fighter • Scout",
-            faction = "Ironward",
-            bondPoints = 10,
-            isRecruited = false,
-            activeSkill = "Quantum Slash",
-            skillDesc = "Unleashes a barrage of high-energy spatial blades dealing 150 Kinetic damage.",
-            portraitSymbol = "🤖",
-            level = 1,
-            weaponEquipped = "Alloy Core Sabot",
-            armorEquipped = "Quantum Plate",
-            accessoryEquipped = "None",
-            moduleEquipped = "Threat Scanner"
+            "ATOM",
+            "Fighter • Scout",
+            "Ironward",
+            10,
+            false,
+            "Quantum Slash",
+            "Unleashes a barrage of high-energy spatial blades dealing 150 Kinetic damage.",
+            "🤖",
+            1,
+            "Alloy Core Sabot",
+            "Quantum Plate",
+            "None",
+            "Threat Scanner"
         )
 
     val companionRarity = when (selectedCompanion.name) {
@@ -8895,7 +14630,7 @@ func _physics_process(delta: float) -> void:
                     color = Color.LightGray
                 )
 
-                Divider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
+                HorizontalDivider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
 
                 // Stats Deck
                 Text(
@@ -8955,7 +14690,7 @@ func _physics_process(delta: float) -> void:
                     }
                 }
 
-                Divider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
+                HorizontalDivider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
 
                 // Character details
                 Row(
@@ -8988,7 +14723,7 @@ func _physics_process(delta: float) -> void:
                     }
                 }
 
-                Divider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
+                HorizontalDivider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
 
                 // Progression Panel (Leveling, Recruitment, Gifting)
                 Text(
@@ -9093,7 +14828,7 @@ func _physics_process(delta: float) -> void:
                     }
                 }
 
-                Divider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
+                HorizontalDivider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
 
                 // Equipment Slot Configuration Bay
                 Text(
@@ -9106,10 +14841,10 @@ func _physics_process(delta: float) -> void:
                 Spacer(modifier = Modifier.height(6.dp))
 
                 val eqSlots = listOf(
-                    "WEAPON" to selectedCompanion.weaponEquipped,
-                    "ARMOR" to selectedCompanion.armorEquipped,
-                    "ACCESSORY" to selectedCompanion.accessoryEquipped,
-                    "MODULE" to selectedCompanion.moduleEquipped
+                    "WEAPON" to (selectedCompanion.weaponEquipped ?: "None"),
+                    "ARMOR" to (selectedCompanion.armorEquipped ?: "None"),
+                    "ACCESSORY" to (selectedCompanion.accessoryEquipped ?: "None"),
+                    "MODULE" to (selectedCompanion.moduleEquipped ?: "None")
                 )
 
                 Row(
@@ -9156,7 +14891,7 @@ func _physics_process(delta: float) -> void:
                     }
                 }
 
-                Divider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
+                HorizontalDivider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
 
                 // Skill Deck (Skill, Bond, Ultimate)
                 Text(
@@ -9224,24 +14959,43 @@ func _physics_process(delta: float) -> void:
                     }
                 }
 
-                Divider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
+                HorizontalDivider(color = QuantumBorder.copy(alpha = 0.4f), modifier = Modifier.padding(vertical = 10.dp))
 
-                // Godot 4.x / GDScript panel
-                Text(
-                    text = "🛠️ GODOT 4.X GDSCRIPT EXPORT",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    color = QuantumNeonOrange
-                )
+                var showKotlinCompanionCode by remember { mutableStateOf(true) }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (showKotlinCompanionCode) "🛠️ KOTLIN & COMPOSE EXPORT" else "🛠️ LEGACY GDSCRIPT EXPORT",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = QuantumNeonOrange
+                    )
+
+                    CyberButton(
+                        onClick = { showKotlinCompanionCode = !showKotlinCompanionCode },
+                        text = if (showKotlinCompanionCode) "Show GDScript" else "Show Kotlin",
+                        color = QuantumNeonOrange.copy(alpha = 0.8f),
+                        modifier = Modifier.height(24.dp)
+                    )
+                }
                 Spacer(modifier = Modifier.height(6.dp))
 
-                // Mini Godot tabs
+                // Mini tabs
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    listOf("1. Node Setup", "2. GDScript Controller", "3. Optimization").forEachIndexed { index, title ->
+                    val tabTitles = if (showKotlinCompanionCode) {
+                        listOf("1. Compose Setup", "2. Kotlin Controller", "3. Optimization")
+                    } else {
+                        listOf("1. Node Setup", "2. GDScript Controller", "3. Legacy Opt")
+                    }
+                    tabTitles.forEachIndexed { index, title ->
                         Box(
                             modifier = Modifier
                                 .weight(1f)
@@ -9272,45 +15026,91 @@ func _physics_process(delta: float) -> void:
                     colors = CardDefaults.cardColors(containerColor = Color.Black)
                 ) {
                     Column(modifier = Modifier.padding(10.dp)) {
-                        when (activeGodotTab) {
-                            0 -> {
-                                Text(
-                                    text = "NODE TREE CONSTRUCTION GUIDE:\n" +
-                                            "Create the following node hierarchy in your Companion scene:\n" +
-                                            "• CharacterBody2D (\"${selectedCompanion.name}Companion\")\n" +
-                                            "  ├── AnimatedSprite2D (\"_animated_sprite\") [Use 32x32 frames]\n" +
-                                            "  ├── CollisionShape2D (Circular, diameter 16px, layer 4, mask 1|2)\n" +
-                                            "  ├── NavigationAgent2D (\"_navigation_agent\")\n" +
-                                            "  " + (if (selectedCompanion.name == "LUMEN") "└── Sprite2D (\"_drone_orbit\") [Orbiting drone particle]\n" else "") +
-                                            "\n" +
-                                            "INSPECTOR PROPERTIES SETTINGS:\n" +
-                                            "1. Motion Mode: set to 'Floating' for smooth hover-movement\n" +
-                                            "2. Collision Layer: Layer 4 (Companions / Friendly Allies)\n" +
-                                            "3. Collision Mask: Layer 1 (Obstacles / Walls) & Layer 2 (Enemies)\n" +
-                                            "4. NavigationAgent2D: Set Path Desired Distance = 10.0, Avoidance Enabled = true",
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 10.sp,
-                                    color = Color.LightGray
-                                )
+                        if (showKotlinCompanionCode) {
+                            when (activeGodotTab) {
+                                0 -> {
+                                    Text(
+                                        text = "JETPACK COMPOSE COMPONENT HIERARCHY:\n" +
+                                                "Instantiate the following component hierarchy in your Companion UI:\n" +
+                                                "• Box (\"${selectedCompanion.name}CompanionContainer\") [Modifier.offset()]\n" +
+                                                "  ├── ImageBitmap/Icon (\"_avatar_view\") [32.dp, animated offset]\n" +
+                                                "  ├── Canvas (\"_bond_ring_glow\") [Circular progress layer]\n" +
+                                                "  ├── StateFlow Tracker (\"_tactical_navigator\")\n" +
+                                                "  " + (if (selectedCompanion.name == "LUMEN") "└── Canvas (\"_drone_orbit_canvas\") [Additive rotating orbital spark]\n" else "") +
+                                                "\n" +
+                                                "COMPOSABLE MODIFIER PROPERTIES:\n" +
+                                                "1. graphicsLayer { translationX = ... } for ultra-smooth 120Hz scrolling\n" +
+                                                "2. touchTarget: minimum 48.dp interactive touch bounds\n" +
+                                                "3. clipping: graphicsLayer(clip = false) for trailing neon particles\n" +
+                                                "4. rememberUpdatedState to track active target locks",
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 10.sp,
+                                        color = Color.LightGray
+                                    )
+                                }
+                                1 -> {
+                                    Text(
+                                        text = translateGdScriptToKotlin(gdscriptCode),
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 9.sp,
+                                        color = QuantumNeonGreen,
+                                        modifier = Modifier.horizontalScroll(rememberScrollState())
+                                    )
+                                }
+                                2 -> {
+                                    Text(
+                                        text = "ANDROID NATIVE COMPOSE OPTIMIZATION:\n" +
+                                                "1. Pre-allocate Path and Paint objects inside remember {} keys to eliminate high Garbage Collector (GC) pressure.\n" +
+                                                "2. Offload state navigation computation to Dispatchers.Default coroutine frames.\n" +
+                                                "3. Use hardware-accelerated BlendMode.Screen on high-density displays (OnePlus 15, Samsung Fold 6) for vibrant visual blending.",
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 10.sp,
+                                        color = Color.LightGray
+                                    )
+                                }
                             }
-                            1 -> {
-                                Text(
-                                    text = gdscriptCode,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 9.sp,
-                                    color = QuantumNeonGreen
-                                )
-                            }
-                            2 -> {
-                                Text(
-                                    text = "HIGH-END MOBILE OPTIMIZATION DIRECTIVES:\n" +
-                                            "1. Avoidance Threading: Force NavigationAgent2D calculations on background physics threads to avoid CPU spikes on OnePlus 15 / Z Fold 6.\n" +
-                                            "2. Process Culling: Turn off set_process_internal(false) for secondary drones. Let physics process handle only pathfinding vectors.\n" +
-                                            "3. Signal Scans: Use Godot groups ('companions', 'threats') rather than repetitive costly get_tree().get_nodes_in_group() calls.",
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 10.sp,
-                                    color = Color.LightGray
-                                )
+                        } else {
+                            when (activeGodotTab) {
+                                0 -> {
+                                    Text(
+                                        text = "NODE TREE CONSTRUCTION GUIDE:\n" +
+                                                "Create the following node hierarchy in your Companion scene:\n" +
+                                                "• CharacterBody2D (\"${selectedCompanion.name}Companion\")\n" +
+                                                "  ├── AnimatedSprite2D (\"_animated_sprite\") [Use 32x32 frames]\n" +
+                                                "  ├── CollisionShape2D (Circular, diameter 16px, layer 4, mask 1|2)\n" +
+                                                "  ├── NavigationAgent2D (\"_navigation_agent\")\n" +
+                                                "  " + (if (selectedCompanion.name == "LUMEN") "└── Sprite2D (\"_drone_orbit\") [Orbiting drone particle]\n" else "") +
+                                                "\n" +
+                                                "INSPECTOR PROPERTIES SETTINGS:\n" +
+                                                "1. Motion Mode: set to 'Floating' for smooth hover-movement\n" +
+                                                "2. Collision Layer: Layer 4 (Companions / Friendly Allies)\n" +
+                                                "3. Collision Mask: Layer 1 (Obstacles / Walls) & Layer 2 (Enemies)\n" +
+                                                "4. NavigationAgent2D: Set Path Desired Distance = 10.0, Avoidance Enabled = true",
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 10.sp,
+                                        color = Color.LightGray
+                                    )
+                                }
+                                1 -> {
+                                    Text(
+                                        text = gdscriptCode,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 9.sp,
+                                        color = QuantumNeonGreen,
+                                        modifier = Modifier.horizontalScroll(rememberScrollState())
+                                    )
+                                }
+                                2 -> {
+                                    Text(
+                                        text = "HIGH-END MOBILE OPTIMIZATION DIRECTIVES:\n" +
+                                                "1. Avoidance Threading: Force NavigationAgent2D calculations on background physics threads to avoid CPU spikes.\n" +
+                                                "2. Process Culling: Turn off set_process_internal(false) for secondary drones. Let physics process handle only pathfinding vectors.\n" +
+                                                "3. Signal Scans: Use Godot groups ('companions', 'threats') rather than costly get_tree().get_nodes_in_group() calls.",
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 10.sp,
+                                        color = Color.LightGray
+                                    )
+                                }
                             }
                         }
                     }
@@ -12525,7 +18325,7 @@ func hover_physics_process(delta: float) -> void:
                                     val arcWidth = if (selectedAnim.name.contains("Cleave")) 80f else 50f
                                     val path = androidx.compose.ui.graphics.Path().apply {
                                         moveTo(cx + 10f, charBaseY - 10f)
-                                        quadraticTo(
+                                        quadraticBezierTo(
                                             cx + arcWidth, charBaseY - 10f,
                                             cx + arcWidth, charBaseY + 15f
                                         )
@@ -13437,20 +19237,273 @@ func _ready() -> void:
     )
 )
 
+fun translateGdScriptToKotlin(gdscript: String): String {
+    return gdscript
+        .replace("extends CharacterBody2D", "class CompanionController(val body: BoxScope) : GameEngineEntity")
+        .replace("extends StaticBody2D", "class StaticStationController(val canvas: Canvas) : GameEngineEntity")
+        .replace("extends Node2D", "class SceneController : GameEngineEntity")
+        .replace("extends Area2D", "class TriggerZoneController : GameEngineEntity")
+        .replace("extends GPUParticles2D", "class ParticleController : GameEngineEntity")
+        .replace("class_name IsometricBuilding", "// Native Android Building Logic")
+        .replace("signal building_hacked(faction_alignment: String)", "val onBuildingHacked = MutableSharedFlow<String>()")
+        .replace("signal structure_deployed(building_id: String, position: Vector2)", "val onStructureDeployed = MutableSharedFlow<Pair<String, Offset>>()")
+        .replace("@export_category", "// Category")
+        .replace("@export_group", "// Group")
+        .replace("@export var", "var")
+        .replace("@onready var", "val")
+        .replace("var base_texture: Texture2D", "var baseTexture: ImageBitmap")
+        .replace("var wall_texture: Texture2D", "var wallTexture: ImageBitmap")
+        .replace("var roof_texture: Texture2D", "var roofTexture: ImageBitmap")
+        .replace("var detail_texture: Texture2D", "var detailTexture: ImageBitmap")
+        .replace("func _ready() -> void:", "override fun onStart() {")
+        .replace("func _ready():", "override fun onStart() {")
+        .replace("func _process(delta: float) -> void:", "override fun onUpdate(delta: Float) {")
+        .replace("func _process(delta):", "override fun onUpdate(delta: Float) {")
+        .replace("func _physics_process(delta: float) -> void:", "override fun onPhysicsTick(delta: Float) {")
+        .replace("func _physics_process(delta):", "override fun onPhysicsTick(delta: Float) {")
+        .replace("self.", "this.")
+        .replace("Vector2.ZERO", "Offset.Zero")
+        .replace("Vector2(", "Offset(")
+        .replace("Color(", "Color(")
+        .replace("var velocity = Offset.Zero", "var velocity = Offset(0f, 0f)")
+        .replace("move_and_slide()", "body.moveAndSlide(velocity)")
+        .replace("queue_free()", "destroy()")
+        .replace("get_node(", "findViewById(")
+        .replace("connect(", "addListener(")
+        .replace("# Godot 4.x GDScript:", "// Native Kotlin & Compose Controller:")
+        .replace("#", "//")
+        .replace("func ", "fun ")
+        .replace(":\n", " {\n")
+        .replace("pass", "")
+}
+
+fun getComposeComponentForNode(nodeName: String): String {
+    return when (nodeName) {
+        "StaticBody2D" -> "Canvas with drawRect & Modifier.pointerInput"
+        "CharacterBody2D" -> "Box with Modifier.offset & AnimatedVisibility"
+        "Area2D" -> "Box with Modifier.combinedClickable"
+        "GPUParticles2D" -> "Compose Canvas with Particle Loop"
+        "CPUParticles2D" -> "Compose Canvas with Particle Loop"
+        "Node2D" -> "Compose Canvas with graphicsLayer"
+        else -> "Jetpack Compose / Modifier"
+    }
+}
+
 fun getDynamicGdScript(vfx: VfxElement, scale: Float, count: Int): String {
     val scaleStr = String.format(java.util.Locale.US, "%.2f", scale)
     val countStr = count.toString()
-    return vfx.gdScript
-        .replace("%scale%", scaleStr)
-        .replace("%count%", countStr)
+    return when (vfx.id) {
+        "melee_slash_arc" -> """
+// ⚡ NATIVE JETPACK COMPOSE HIGH-PERFORMANCE SWEEP PARTICLE SYSTEM
+// Implementation using pre-allocated objects & hardware accelerated Canvas
+
+class ComposeSlashVfxEngine(val maxParticles: Int = $countStr) {
+    private val particles = Array(maxParticles) { SlashParticle() }
+    private val path = Path()
+    private val brush = Brush.linearGradient(
+        colors = listOf(Color(0xFF00E5FF), Color(0xFFD500F9), Color.Transparent)
+    )
+
+    fun draw(drawScope: DrawScope, scale: Float = $scaleStr) = with(drawScope) {
+        val center = size.center
+        val radius = 120dp.toPx() * scale
+        
+        // Draw primary blade sweep trail with Additive Blending
+        path.reset()
+        path.arcTo(
+            rect = Rect(center - Offset(radius, radius), center + Offset(radius, radius)),
+            startAngleDegrees = -120f,
+            sweepAngleDegrees = 90f,
+            forceMoveTo = true
+        )
+        drawPath(
+            path = path,
+            brush = brush,
+            style = Stroke(width = 8dp.toPx(), cap = StrokeCap.Round),
+            blendMode = BlendMode.Screen
+        )
+        
+        // Render glowing energy sparks
+        particles.forEach { p ->
+            p.update()
+            drawCircle(
+                color = p.color.copy(alpha = p.alpha),
+                radius = p.size * scale,
+                center = center + Offset(p.x, p.y),
+                blendMode = BlendMode.Screen
+            )
+        }
+    }
+}
+        """.trimIndent()
+        
+        "plasma_ring_aoe" -> """
+// ⚡ NATIVE JETPACK COMPOSE RADIAL ADDITIVE BLAST
+// Optimized for high-end Android (Samsung Fold 6, OnePlus 15)
+
+@Composable
+fun PlasmaRingAoeVfx(
+    modifier: Modifier = Modifier,
+    scale: Float = $scaleStr,
+    isPlaying: Boolean = true
+) {
+    val scaleAnim by animateFloatAsState(
+        targetValue = if (isPlaying) scale * 2f else 0.5f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        )
+    )
+    
+    val alphaAnim by animateFloatAsState(
+        targetValue = if (isPlaying) 0f else 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        )
+    )
+
+    Canvas(modifier = modifier.fillMaxSize().graphicsLayer(alpha = alphaAnim)) {
+        val center = size.center
+        val maxRadius = 150dp.toPx() * scaleAnim
+        
+        // Outer Shockwave Glow Ring
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(Color(0xFFFF1744).copy(alpha = 0.8f), Color.Transparent),
+                center = center,
+                radius = maxRadius
+            ),
+            radius = maxRadius,
+            blendMode = BlendMode.Screen
+        )
+        
+        // High-frequency energy core border
+        drawCircle(
+            color = Color(0xFFFFD600),
+            radius = maxRadius * 0.9f,
+            style = Stroke(width = 4dp.toPx()),
+            blendMode = BlendMode.Screen
+        )
+    }
+}
+        """.trimIndent()
+
+        "arcane_lightning" -> """
+// ⚡ FRACTAL BRANCHING LIGHTNING EMITTER IN JETPACK COMPOSE
+// Hardware-accelerated drawing on native Android graphics rendering pipeline
+
+fun DrawScope.drawArcaneLightning(
+    start: Offset,
+    end: Offset,
+    branches: Int = 4,
+    scale: Float = $scaleStr
+) {
+    val points = mutableListOf<Offset>()
+    points.add(start)
+    
+    val segments = 8
+    val delta = (end - start) / segments.toFloat()
+    
+    var current = start
+    for (i in 1 until segments) {
+        val mid = start + delta * i.toFloat()
+        // Orthogonal offset for jagged fractal lightning aesthetics
+        val ortho = Offset(-delta.y, delta.x).normalize() * 
+                    (Random.nextFloat() - 0.5f) * 40dp.toPx() * scale
+        current = mid + ortho
+        points.add(current)
+    }
+    points.add(end)
+
+    // Render primary high-voltage beam with dynamic additive color mapping
+    for (i in 0 until points.lastIndex) {
+        drawLine(
+            color = Color(0xFF00E5FF),
+            start = points[i],
+            end = points[i + 1],
+            strokeWidth = 5dp.toPx() * scale,
+            cap = StrokeCap.Round,
+            blendMode = BlendMode.Screen
+        )
+        // Secondary Inner Core White Heat Beam
+        drawLine(
+            color = Color.White,
+            start = points[i],
+            end = points[i + 1],
+            strokeWidth = 2dp.toPx() * scale,
+            cap = StrokeCap.Round,
+            blendMode = BlendMode.Screen
+        )
+    }
+}
+        """.trimIndent()
+
+        else -> """
+// ⚡ HIGH-PERFORMANCE COMPOSABLE PARTICLE ENGINE
+// Configured with $countStr dynamic particles, scale = $scaleStr
+// Leverages DrawScope blending and system navigation bar safe bounds
+
+class ComposeGpuVfxEngine(val count: Int = $countStr, val scale: Float = $scaleStr) {
+    private val particles = List(count) {
+        ComposeParticle(
+            color = Color(0xFFD500F9),
+            angle = Random.nextFloat() * 360f,
+            velocity = (2f + Random.nextFloat() * 5f)
+        )
+    }
+
+    fun render(drawScope: DrawScope) = with(drawScope) {
+        val origin = size.center
+        particles.forEach { p ->
+            p.update()
+            drawCircle(
+                color = p.color.copy(alpha = p.alpha),
+                radius = 4dp.toPx() * scale * p.scale,
+                center = origin + Offset(p.x, p.y),
+                blendMode = BlendMode.Screen
+            )
+        }
+    }
+}
+        """.trimIndent()
+    }
 }
 
 fun getDynamicSetupInstructions(vfx: VfxElement, scale: Float, count: Int): String {
-    val scaleStr = String.format(java.util.Locale.US, "%.2f", scale)
-    val countStr = count.toString()
-    return vfx.setupInstructions
-        .replace("%scale%", scaleStr)
-        .replace("%count%", countStr)
+    return when (vfx.id) {
+        "melee_slash_arc" -> """
+1. Instantiate a custom drawing class inside your Composable, keeping allocations OUT of the DrawScope to avoid Garbage Collector (GC) pressure.
+2. Setup a stateful Canvas: Canvas(modifier = Modifier.fillMaxSize().graphicsLayer(clip = false))
+3. Use DrawScope.drawPath to render the high-frequency plasma blade sweep curve with a LinearGradient Brush.
+4. Pass BlendMode.Screen to enable native GPU additive glow shading on the canvas draw operations.
+5. Setup a high-refresh Game Loop (using a coroutine Channel or target 60FPS tick via Flow) to update particle physics and trigger redraws.
+""".trimIndent()
+
+        "plasma_ring_aoe" -> """
+1. Configure a state-driven drawing pipeline using Jetpack Compose dynamic transition animation loops.
+2. Use animateFloatAsState to transition the shockwave expansion radius and alpha fadeout.
+3. Call DrawScope.drawCircle using Brush.radialGradient to simulate the plasma heat-shimmer core.
+4. Set hardware acceleration explicitly by wrapping the Canvas with modifier.graphicsLayer(renderEffect = ...).
+5. Leverage dynamic BlendMode.Screen to allow plasma colors to additively saturate over overlapping screen backgrounds.
+""".trimIndent()
+
+        "arcane_lightning" -> """
+1. Generate jagged lightning line coordinates using midpoint displacement (fractal branching recursion).
+2. Inside Compose Canvas, render the branching paths by sequentially calling DrawScope.drawLine.
+3. Draw two layers: a thicker outer neon cyan glow line (e.g. 6dp) and a thinner inner hot white core (2dp) for full electric realism.
+4. Apply graphicsLayer modifier to the Canvas to handle hardware-accelerated drawing and automatic frame cache management.
+5. Limit fractal depth to 3 levels on mobile hardware to prevent canvas draw overhead and maintain locked 60 FPS on Android devices.
+""".trimIndent()
+
+        else -> """
+1. Setup a persistent particle array inside a remember {} block to prevent frame-by-frame heap allocations during standard composition.
+2. Inside the Compose Canvas DrawScope, iterate over the particle array, updating positions and drawing circles.
+3. Always configure graphicsLayer(clip = false) on your Composable modifier to ensure particles can drift beyond the strict layouts of parent composables.
+4. Apply BlendMode.Screen to allow overlapping particles to merge into brilliant neon highlights.
+5. Scale all dimensions using LocalDensity.current to translate raw design dp/sp dimensions into exact system pixels.
+""".trimIndent()
+    }
 }
 
 fun triggerVfxBurst(vfxId: String, simulatedParticles: androidx.compose.runtime.snapshots.SnapshotStateList<LocalSimParticle>, particleCount: Float) {
@@ -14647,7 +20700,7 @@ fun VfxLibraryView(
                 }
             }
 
-            // 3. Tabbed Production GDScript Exporter and Inspector Setup
+            // 3. Tabbed Production Composable Exporter and Setup
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -14664,7 +20717,7 @@ fun VfxLibraryView(
                             .padding(2.dp),
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        val tabs = listOf("⚡ GDSCRIPT ENGINE", "📋 INSPECTOR SETUP", "📱 MOBILE PERFORMANCE", "🖼️ COMBAT VFX SHEET")
+                        val tabs = listOf("⚡ COMPOSE ENGINE", "📋 COMPOSE SETUP", "📱 MOBILE PERFORMANCE", "🖼️ COMBAT VFX SHEET")
                         tabs.forEachIndexed { idx, label ->
                             val isSelected = activeTab == idx
                             Box(
@@ -14702,7 +20755,7 @@ fun VfxLibraryView(
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Text(
-                                        text = "GODOT 4.X READY GDSCRIPT (SLIDERS SYNCHRONIZED)",
+                                        text = "ANDROID COMPOSE READY KOTLIN ENGINE (SLIDERS SYNCHRONIZED)",
                                         color = VfxPurple,
                                         fontSize = 8.sp,
                                         fontWeight = FontWeight.Bold,
@@ -14750,7 +20803,7 @@ fun VfxLibraryView(
                             // Inspector Setup Instructions for non-coders
                             Column(modifier = Modifier.fillMaxSize()) {
                                 Text(
-                                    text = "STEP-BY-STEP INSPECTOR INTEGRATION (NO CODE REQUIRED)",
+                                    text = "STEP-BY-STEP JETPACK COMPOSE INTEGRATION (NO CODE REQUIRED)",
                                     color = VfxGold,
                                     fontSize = 8.sp,
                                     fontWeight = FontWeight.Bold,
@@ -14769,17 +20822,17 @@ fun VfxLibraryView(
                                 ) {
                                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                         Text(
-                                            text = "Primary Node Type: ${selectedVfx.godotNode}",
+                                            text = "Primary Compose Component: ${getComposeComponentForNode(selectedVfx.godotNode)}",
                                             color = Color.White,
                                             fontSize = 9.sp,
                                             fontWeight = FontWeight.Bold,
                                             fontFamily = FontFamily.Monospace
                                         )
                                         
-                                        Divider(color = VfxBorder.copy(alpha = 0.3f))
+                                        HorizontalDivider(color = VfxBorder.copy(alpha = 0.3f))
                                         
                                         Text(
-                                            text = "Critical Inspector Properties to Configure:",
+                                            text = "Critical Composable Modifiers to Configure:",
                                             color = VfxCyan,
                                             fontSize = 8.5.sp,
                                             fontWeight = FontWeight.Bold
@@ -14795,10 +20848,10 @@ fun VfxLibraryView(
                                             }
                                         }
                                         
-                                        Divider(color = VfxBorder.copy(alpha = 0.3f))
+                                        HorizontalDivider(color = VfxBorder.copy(alpha = 0.3f))
                                         
                                         Text(
-                                            text = "Godot Implementation Steps:",
+                                            text = "Android Implementation Steps:",
                                             color = VfxPurple,
                                             fontSize = 8.5.sp,
                                             fontWeight = FontWeight.Bold
@@ -14851,7 +20904,7 @@ fun VfxLibraryView(
                                     }
                                 }
                                 
-                                Divider(color = VfxBorder.copy(alpha = 0.3f))
+                                HorizontalDivider(color = VfxBorder.copy(alpha = 0.3f))
                                 
                                 Text(
                                     text = "Target Hardware: Samsung Galaxy Z Fold 6 / OnePlus 15 Pro",
@@ -14913,7 +20966,7 @@ fun VfxLibraryView(
                                     }
                                 }
                                 
-                                Divider(color = VfxBorder.copy(alpha = 0.3f))
+                                HorizontalDivider(color = VfxBorder.copy(alpha = 0.3f))
                                 
                                 Text(
                                     text = "💡 LEAD DEV MOBILE OPTIMIZATION TRICKS:",
@@ -14965,42 +21018,42 @@ fun VfxReferenceSheetTab(
                 emoji = "🗡️",
                 description = "High-velocity blade sweeps, crushing ground impacts, and physical kinetic impacts. Standard frame rate is 8-12 FPS with strong directional motion blur.",
                 combatVfxIds = listOf("melee_slash_arc"),
-                godotTip = "Tip: Use CPUParticles2D or a Line2D with a gradient outline to render smooth motion trails on physical sweeps."
+                godotTip = "Tip: Use Compose Custom Canvas with Path and DrawScope.drawPath to render smooth, high-fidelity neon sweep trails."
             ),
             CategoryDetail(
                 title = "Ranged & Projectile Effects",
                 emoji = "🏹",
                 description = "Homing energy bolts, piercing sniper rails, and projectile trail particles. Built with extreme speed scales and additive glows.",
                 combatVfxIds = listOf("plasma_ring_aoe", "arcane_lightning"),
-                godotTip = "Tip: Lock particle coordinates to Local to keep trails attached to flying projectiles, or Global for space dust."
+                godotTip = "Tip: Use rememberUpdatedState to track active targets on background coroutine frames while drawing projectiles."
             ),
             CategoryDetail(
                 title = "Energy & Tech Effects",
                 emoji = "⚡",
                 description = "Force fields, gravitational wells, and EMP blasts. Styled with neon-purple and cyan geometric meshes, ring curves, and digitized grids.",
                 combatVfxIds = listOf("plasma_ring_aoe", "cybermatic_assembler"),
-                godotTip = "Tip: Combine CanvasItem draw commands or custom shaders with expanding ring mesh textures for holographic effects."
+                godotTip = "Tip: Combine DrawScope.drawCircle radial gradient brushes with BlendMode.Screen for vibrant, glowing holographic rings."
             ),
             CategoryDetail(
                 title = "Magic & Elemental Effects",
                 emoji = "🔥",
                 description = "Raging firestorms, crackling thunderbolts, and localized ice storms. Employs dynamic heat-distortion shaders and complex particle color ramps.",
                 combatVfxIds = listOf("arcane_lightning", "neon_rain", "fission_explosion"),
-                godotTip = "Tip: Use color curves that shift from pure white at emission to highly saturated orange/blue, fading into gray smoke."
+                godotTip = "Tip: Apply dynamic color transitions using animateColorAsState to interpolate particles from hot core white to neon orange/magenta."
             ),
             CategoryDetail(
                 title = "Status & Debuff Effects",
                 emoji = "💀",
                 description = "Corrosive neon toxic gas, burning nano-fires, freezing ice halos, and slow-motion field bubbles. Emitted in low-velocity circular patterns.",
                 combatVfxIds = listOf("gas_vent", "neon_rain"),
-                godotTip = "Tip: Animate standard material scale down over time to represent dissolving or dispersing gases and fields."
+                godotTip = "Tip: Linearly scale down particle size and decrease alpha to simulate fading, dissolving or dispersing fields."
             ),
             CategoryDetail(
                 title = "Heal & Support Effects",
                 emoji = "❇️",
                 description = "Nanite healing pulses, digital shields, speed boosts, and revivals. Styled with soft emerald green and golden sparkles and upward-drifting cross symbols.",
                 combatVfxIds = listOf("heal_pulse", "cybermatic_assembler"),
-                godotTip = "Tip: Use negative gravity values in ParticleProcessMaterial to trigger slow, floaty upward-rising particles."
+                godotTip = "Tip: Apply negative Y velocity to spark coordinates to trigger slow, floaty upward-drifting cross symbols."
             )
         )
     }
@@ -15319,4 +21372,1668 @@ data class ImpactVariation(
     val color: Color
 )
 
+@Composable
+fun BoxScope.SkeletalNodeButton(
+    slot: AugmentSlot,
+    currentSelected: AugmentSlot,
+    onSelect: () -> Unit,
+    biasX: Float,
+    biasY: Float
+) {
+    val alignment = BiasAlignment(biasX, biasY)
+    val isSelected = slot == currentSelected
 
+    Box(
+        modifier = Modifier
+            .align(alignment)
+            .size(48.dp)
+            .clickable(
+                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                indication = null,
+                onClick = onSelect
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .size(14.dp)
+                .background(
+                    color = if (isSelected) QuantumNeonOrange else QuantumNeonBlue,
+                    shape = CircleShape
+                )
+                .border(2.dp, Color.White, CircleShape)
+        )
+    }
+}
+
+fun getGdscriptCodeForSlot(slot: AugmentSlot): String {
+    return when (slot) {
+        AugmentSlot.CRANIAL -> """
+# ==========================================
+# CranialSynapseNode.gd - "Quantum Effect"
+# Mobile Optimized Sub-second Tick Regulator
+# ==========================================
+extends Node
+
+signal process_completed(duration_ms)
+
+@export var is_overclocked: bool = true
+var _total_ticks: int = 0
+
+func _physics_process(delta: float) -> void:
+    if is_overclocked:
+        var start_time = Time.get_ticks_usec()
+        _calculate_neural_matrices()
+        var elapsed = (Time.get_ticks_usec() - start_time) / 1000.0
+        if _total_ticks % 60 == 0:
+            emit_signal("process_completed", elapsed)
+    _total_ticks += 1
+
+func _calculate_neural_matrices() -> void:
+    var focus_mult = 1.35
+    var vector_a = Vector2(100, 200)
+    var vector_b = Vector2(300, 400)
+    var dist = vector_a.distance_squared_to(vector_b) * focus_mult
+""".trimIndent()
+
+        AugmentSlot.SENSORY -> """
+# ==========================================
+# SensoryRadarScanner.gd - "Quantum Effect"
+# Low-Cost Overlapping Concentric Area Scanner
+# ==========================================
+extends Area2D
+
+signal threats_scanned(count)
+
+@export var scan_radius: float = 120.0
+var _scan_timer: float = 0.0
+const SCAN_INTERVAL: float = 0.15
+
+func _ready() -> void:
+    get_node("CollisionShape2D").shape.radius = scan_radius
+
+func _process(delta: float) -> void:
+    _scan_timer += delta
+    if _scan_timer >= SCAN_INTERVAL:
+        _scan_timer = 0.0
+        _perform_area_sweep()
+
+func _perform_area_sweep() -> void:
+    var overlapping_bodies = get_overlapping_bodies()
+    var threat_count = 0
+    for body in overlapping_bodies:
+        if body.is_in_group("enemies"):
+            threat_count += 1
+    emit_signal("threats_scanned", threat_count)
+""".trimIndent()
+
+        AugmentSlot.TORSO -> """
+# ==========================================
+# TorsoDeflectorChassis.gd - "Quantum Effect"
+# Dynamic Kinetic Deflection & Damage Multipliers
+# ==========================================
+extends CollisionShape2D
+
+signal damage_absorbed(amount)
+
+@export var base_deflection_rate: float = 0.25
+@export var charge_regeneration: float = 5.0
+
+var shield_charge: float = 100.0
+var max_shield: float = 100.0
+
+func process_kinetic_impact(incoming_dmg: float) -> float:
+    var absorbed = incoming_dmg * base_deflection_rate
+    shield_charge = clampf(shield_charge - absorbed * 0.5, 0.0, max_shield)
+    emit_signal("damage_absorbed", absorbed)
+    return incoming_dmg - absorbed
+""".trimIndent()
+
+        AugmentSlot.QUANTUM_CORE -> """
+# ==========================================
+# QuantumReactorCore.gd - "Quantum Effect"
+# Particle System Energy Draw and MP Capacitors
+# ==========================================
+extends GPUParticles2D
+
+signal core_resonance_reached(frequency)
+
+@export var draw_rate: float = 2.5
+var active_resonance: float = 440.0
+
+func trigger_energy_draw(mp_consumed: float) -> void:
+    self.amount = int(clampf(mp_consumed * 5.0, 10.0, 150.0))
+    self.emitting = true
+    
+    var t = create_tween()
+    t.tween_property(self, "speed_scale", 2.2, 0.4)
+    t.tween_property(self, "speed_scale", 1.0, 0.8)
+    emit_signal("core_resonance_reached", active_resonance + mp_consumed)
+""".trimIndent()
+
+        AugmentSlot.ARMS -> """
+# ==========================================
+# ArmActuatorStabilizer.gd - "Quantum Effect"
+# Aiming Interpolation & Dynamic Recoil Lerp
+# ==========================================
+extends Node2D
+
+@export var sway_reduction: float = 0.45
+@export var lerp_weight: float = 0.15
+
+var _target_aim_angle: float = 0.0
+var _current_aim_angle: float = 0.0
+
+func update_actuator_aim(target_pos: Vector2) -> void:
+    _target_aim_angle = (target_pos - global_position).angle()
+    _current_aim_angle = lerp_angle(_current_aim_angle, _target_aim_angle, lerp_weight)
+    global_rotation = _current_aim_angle
+""".trimIndent()
+
+        AugmentSlot.LEGS -> """
+# ==========================================
+# LegBoosterPhysics.gd - "Quantum Effect"
+# Isometric Slide Friction Calculations
+# ==========================================
+extends CharacterBody2D
+
+@export var slide_friction: float = 0.88
+@export var dash_speed_mult: float = 2.5
+
+var is_sliding: bool = false
+var slide_vector: Vector2 = Vector2.ZERO
+
+func apply_mobility_thrust(move_input: Vector2, speed: float) -> void:
+    if is_sliding:
+        slide_vector = slide_vector * slide_friction
+        velocity = slide_vector
+        if velocity.length_squared() < 100.0:
+            is_sliding = false
+    else:
+        velocity = move_input * speed
+    move_and_slide()
+""".trimIndent()
+
+        AugmentSlot.DERMAL -> """
+# ==========================================
+# AdaptiveDermalShield.gd - "Quantum Effect"
+# Environment Hazard Filter Line Controller
+# ==========================================
+extends Line2D
+
+@export var thermal_resistance: float = 0.35
+var _opacity_phase: float = 0.0
+
+func _process(delta: float) -> void:
+    _opacity_phase += delta * 4.0
+    var alpha = 0.4 + sin(_opacity_phase) * 0.2
+    self.default_color.a = alpha
+""".trimIndent()
+    }
+}
+
+fun getKotlinCodeForSlot(slot: AugmentSlot): String {
+    return when (slot) {
+        AugmentSlot.CRANIAL -> """
+// Synaptic Synapse Controller Equivalent in Jetpack Compose
+@Composable
+fun SynapticCranialOverclocker(
+    synapticTicksFlow: StateFlow<Long>,
+    modifier: Modifier = Modifier
+) {
+    val tickCount by synapticTicksFlow.collectAsState()
+    val glowBrush = remember {
+        Brush.radialGradient(listOf(Color(0xFF00E5FF), Color.Transparent))
+    }
+    Box(modifier = modifier.size(64.dp)) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val radius = size.minDimension / 2f
+            drawCircle(brush = glowBrush, radius = radius * (1.0f + sin(tickCount * 0.1f) * 0.15f))
+        }
+    }
+}
+""".trimIndent()
+
+        AugmentSlot.SENSORY -> """
+// Concentric Overlapping Scanner Equivalent in Jetpack Compose
+@Composable
+fun ConcentricSensoryArray(
+    scanResultFlow: StateFlow<Int>,
+    modifier: Modifier = Modifier
+) {
+    val activeThreats by scanResultFlow.collectAsState()
+    val sweepPulse = rememberInfiniteTransition().animateFloat(
+        initialValue = 0f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(2000, easing = LinearEasing))
+    )
+    Box(modifier = modifier.size(120.dp), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val maxRadius = size.minDimension / 2f
+            drawCircle(
+                color = Color(0xFFFF5252),
+                radius = maxRadius * sweepPulse.value,
+                style = Stroke(width = 1.5.dp.toPx()),
+                alpha = 1.0f - sweepPulse.value
+            )
+        }
+        Text("SCANNING: ${'$'}activeThreats", color = Color.White, fontSize = 9.sp)
+    }
+}
+""".trimIndent()
+
+        AugmentSlot.TORSO -> """
+// Sub-dermal Defensive Shield Mesh in Jetpack Compose
+@Composable
+fun DeflectorTorsoChassis(
+    shieldPower: Float,
+    modifier: Modifier = Modifier
+) {
+    val pulseAlpha by rememberInfiniteTransition().animateFloat(
+        initialValue = 0.3f, targetValue = 0.7f,
+        animationSpec = infiniteRepeatable(tween(1500), RepeatMode.Reverse)
+    )
+    Box(modifier = modifier.size(80.dp), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            drawCircle(
+                color = Color(0xFF00E5FF),
+                radius = (size.minDimension / 2f) * shieldPower,
+                style = Stroke(width = 2.dp.toPx()),
+                alpha = pulseAlpha
+            )
+        }
+    }
+}
+""".trimIndent()
+
+        AugmentSlot.QUANTUM_CORE -> """
+// Subtractive Glow Quantum Reactor Core in Jetpack Compose
+@Composable
+fun QuantumReactorCoreVfx(
+    mpLevel: Int,
+    modifier: Modifier = Modifier
+) {
+    val rotation by rememberInfiniteTransition().animateFloat(
+        initialValue = 0f, targetValue = 360f,
+        animationSpec = infiniteRepeatable(tween(3000, easing = LinearEasing))
+    )
+    Box(modifier = modifier.size(100.dp)) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            rotate(rotation) {
+                val reactorBrush = Brush.sweepGradient(
+                    listOf(Color(0xFFD500F9), Color(0xFF00E5FF), Color(0xFFD500F9))
+                )
+                drawCircle(brush = reactorBrush, style = Stroke(width = 4.dp.toPx()))
+            }
+        }
+    }
+}
+""".trimIndent()
+
+        AugmentSlot.ARMS -> """
+// Actuator Aiming Interpolation in Jetpack Compose
+@Composable
+fun AimActuatorStabilizer(
+    aimAngleDegrees: Float,
+    modifier: Modifier = Modifier
+) {
+    val animatedAngle by animateFloatAsState(targetValue = aimAngleDegrees)
+    Box(modifier = modifier.size(48.dp).graphicsLayer { rotationZ = animatedAngle }) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            drawLine(Color(0xFFFF9100), Offset(0f, size.height/2f), Offset(size.width, size.height/2f), strokeWidth = 2f)
+            drawLine(Color(0xFFFF9100), Offset(size.width/2f, 0f), Offset(size.width/2f, size.height), strokeWidth = 2f)
+        }
+    }
+}
+""".trimIndent()
+
+        AugmentSlot.LEGS -> """
+// Responsive Mobility Slide Tracker in Jetpack Compose
+@Composable
+fun MobilityLegBoosters(
+    isSliding: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val slideGlowHeight by animateDpAsState(if (isSliding) 24.dp else 4.dp)
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(slideGlowHeight)
+            .background(Brush.verticalGradient(listOf(Color(0xFF00E5FF), Color.Transparent)))
+    )
+}
+""".trimIndent()
+
+        AugmentSlot.DERMAL -> """
+// Environment Hazard Skin Filtration Mesh in Jetpack Compose
+@Composable
+fun EnvironmentalDermalShell(
+    modifier: Modifier = Modifier
+) {
+    val pulseScale by rememberInfiniteTransition().animateFloat(
+        initialValue = 0.95f, targetValue = 1.05f,
+        animationSpec = infiniteRepeatable(tween(2000), RepeatMode.Reverse)
+    )
+    Box(
+        modifier = modifier
+            .size(72.dp)
+            .graphicsLayer {
+                scaleX = pulseScale
+                scaleY = pulseScale
+            }
+            .border(2.dp, Color(0xFF00FF87), RoundedCornerShape(12.dp))
+    )
+}
+""".trimIndent()
+    }
+}
+
+fun getGodotSetupStepsForSlot(slot: AugmentSlot): List<String> {
+    return when (slot) {
+        AugmentSlot.CRANIAL -> listOf(
+            "Create a new Node as a child of your player CharacterBody2D named 'CranialProcessor'.",
+            "In the Inspector, set 'Process Mode' to 'Physics' to ensure sub-second ticks runs on the physics thread.",
+            "Right-click 'CranialProcessor', attach 'CranialSynapseNode.gd', and check the 'Is Overclocked' option.",
+            "Connect the 'process_completed' signal to your developer debug screen HUD using a RichTextLabel."
+        )
+        AugmentSlot.SENSORY -> listOf(
+            "Add an Area2D node under your player named 'SensoryScanner'.",
+            "Add a CollisionShape2D as a child and assign a CircleShape2D to its Shape property.",
+            "In the Inspector, set Collision Layer to 0 (disabled) and Collision Mask to 2 (Enemy Faction Allies).",
+            "Attach 'SensoryRadarScanner.gd' to the 'SensoryScanner' node and set Scan Radius = 150px."
+        )
+        AugmentSlot.TORSO -> listOf(
+            "Locate the player's primary CollisionShape2D node (usually CapsuleShape2D).",
+            "Attach the 'TorsoDeflectorChassis.gd' script directly to this CollisionShape2D.",
+            "Set Deflection Rate in inspector: 0.25 (reduces kinetic impact by 25%).",
+            "In your player controller script, redirect raw damage: damage = collision_shape.process_kinetic_impact(raw_dmg)."
+        )
+        AugmentSlot.QUANTUM_CORE -> listOf(
+            "Create a GPUParticles2D named 'ReactorGlow' at the player's pivot coordinate.",
+            "Create a new ParticleProcessMaterial under Process Material in the Inspector.",
+            "Set Gravity = Vector3(0, -9.8, 0) and Color = linearGradient from Neon Magenta to Neon Cyan.",
+            "Attach 'QuantumReactorCore.gd' to 'ReactorGlow' and link core_resonance_reached to adjust sound pitches."
+        )
+        AugmentSlot.ARMS -> listOf(
+            "Create a Node2D under your Player named 'ArmStabilizer'. Set its relative offset to hands.",
+            "In the Inspector, set relative coordinates: Position = Vector2(16, -6).",
+            "Attach the 'ArmActuatorStabilizer.gd' script to 'ArmStabilizer'.",
+            "Add a Sprite2D (weapon visual) as a child. Call update_actuator_aim(get_global_mouse_position()) in _process."
+        )
+        AugmentSlot.LEGS -> listOf(
+            "Ensure your player root node is a CharacterBody2D. Add CPUParticles2D at feet for sliding trails.",
+            "In the Inspector, enable Motion Mode = Grounded and set Slide Safe Margin = 0.08.",
+            "Attach 'LegBoosterPhysics.gd' directly to your player root character script.",
+            "Call apply_mobility_thrust() in _physics_process to bypass standard slow movement."
+        )
+        AugmentSlot.DERMAL -> listOf(
+            "Add a Line2D node under your Player named 'DermalBoundaryLines'.",
+            "In the Inspector, set Point 0 = Vector2(-12, -24) and Point 1 = Vector2(12, -24) as defensive shoulders.",
+            "Set Width = 3.0 and choose a vibrant neon green under Gradient.",
+            "Attach 'AdaptiveDermalShield.gd' and let the sine-wave script update default_color alpha."
+        )
+    }
+}
+
+@Composable
+fun InventoryScreen(
+    viewModel: GameViewModel,
+    modifier: Modifier = Modifier
+) {
+    val gameState by viewModel.gameStateFlow.collectAsState(initial = GameState())
+    var selectedCategory by remember { mutableStateOf("ALL") }
+    var selectedItemId by remember { mutableStateOf<String?>(null) }
+
+    val categories = listOf("ALL", "EQUIPMENT", "CONSUMABLE", "RESOURCES", "SCRAP")
+
+    // Filter items based on selected category
+    val filteredItems = remember(gameState.inventory, selectedCategory) {
+        when (selectedCategory) {
+            "ALL" -> gameState.inventory
+            "EQUIPMENT" -> gameState.inventory.filter { it.category == "Equipment" }
+            "CONSUMABLE" -> gameState.inventory.filter { it.category in listOf("Food", "Energy Cell", "Medicine") }
+            "RESOURCES" -> gameState.inventory.filter { it.category == "Mineral" || it.category == "Crafting Material" }
+            "SCRAP" -> gameState.inventory.filter { it.category == "Scrap" }
+            else -> gameState.inventory
+        }
+    }
+
+    val selectedItem = remember(gameState.inventory, selectedItemId) {
+        gameState.inventory.find { it.id == selectedItemId } ?: filteredItems.firstOrNull()
+    }
+
+    // Auto-select the first item of the filtered category if selected is no longer valid/filtered
+    LaunchedEffect(filteredItems) {
+        if (selectedItem == null || selectedItem !in filteredItems) {
+            selectedItemId = filteredItems.firstOrNull()?.id
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(QuantumDarkBg)
+            .padding(16.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize()
+        ) {
+            // --- HEADER HUB ---
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(QuantumCardBg)
+                    .border(1.dp, QuantumNeonPurple, RoundedCornerShape(8.dp))
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "SECURE COLD-STORAGE HUB",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            color = QuantumNeonPurple,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 1.5.sp
+                        )
+                    )
+                    Text(
+                        text = "SYNCED WITH SYSTEM ARCHITECTURE (v3.85.1-NET)",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = QuantumGrayText,
+                            fontSize = 9.sp
+                        )
+                    )
+                }
+                
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Credits
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text("CREDITS", style = MaterialTheme.typography.labelSmall.copy(color = QuantumGrayText))
+                        Text("🪙 ${gameState.credits}", style = MaterialTheme.typography.titleMedium.copy(color = QuantumNeonBlue, fontWeight = FontWeight.Bold))
+                    }
+                    // Nanites
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text("NANITES", style = MaterialTheme.typography.labelSmall.copy(color = QuantumGrayText))
+                        Text("💎 ${gameState.nanites}", style = MaterialTheme.typography.titleMedium.copy(color = QuantumNeonGreen, fontWeight = FontWeight.Bold))
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // --- CATEGORY TABS ---
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                categories.forEach { cat ->
+                    val isSelected = selectedCategory == cat
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(if (isSelected) QuantumNeonPurple else QuantumCardBg)
+                            .border(1.dp, if (isSelected) QuantumNeonBlue else QuantumBorder, RoundedCornerShape(4.dp))
+                            .clickable { selectedCategory = cat }
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = cat,
+                            color = if (isSelected) QuantumLightText else QuantumGrayText,
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 1.sp
+                            )
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // --- MAIN PANES ---
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // Left Pane: List of filtered items
+                Box(
+                    modifier = Modifier
+                        .weight(1.2f)
+                        .fillMaxHeight()
+                        .background(QuantumCardBg)
+                        .border(1.dp, QuantumBorder, RoundedCornerShape(8.dp))
+                ) {
+                    if (filteredItems.isEmpty()) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "NO OBJECTS IN STORAGE",
+                                color = QuantumGrayText,
+                                style = MaterialTheme.typography.bodyMedium.copy(letterSpacing = 1.sp)
+                            )
+                        }
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(filteredItems) { item ->
+                                val isSelected = selectedItemId == item.id
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(if (isSelected) QuantumDarkBg else Color.Transparent)
+                                        .border(
+                                            1.dp,
+                                            if (isSelected) QuantumNeonBlue else QuantumBorder,
+                                            RoundedCornerShape(6.dp)
+                                        )
+                                        .clickable { selectedItemId = item.id }
+                                        .padding(8.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        // Item Icon Symbol
+                                        Box(
+                                            modifier = Modifier
+                                                .size(40.dp)
+                                                .background(QuantumCardBg, RoundedCornerShape(4.dp))
+                                                .border(1.dp, if (item.isEquipped) QuantumNeonGreen else QuantumBorder, RoundedCornerShape(4.dp)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(item.iconSymbol, fontSize = 20.sp)
+                                        }
+
+                                        // Item Info
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = item.name,
+                                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                                        color = if (isSelected) QuantumNeonBlue else QuantumLightText,
+                                                        fontWeight = FontWeight.Bold
+                                                    ),
+                                                    maxLines = 1
+                                                )
+                                                Text(
+                                                    text = "x${item.quantity}",
+                                                    style = MaterialTheme.typography.bodySmall.copy(
+                                                        color = QuantumNeonOrange,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                )
+                                            }
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = item.category.uppercase(),
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        color = QuantumGrayText,
+                                                        fontSize = 9.sp
+                                                    )
+                                                )
+                                                if (item.isEquipped) {
+                                                    Text(
+                                                        text = "EQUIPPED",
+                                                        style = MaterialTheme.typography.labelSmall.copy(
+                                                            color = QuantumNeonGreen,
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontSize = 8.sp
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Right Pane: Inspector Details Panel
+                Box(
+                    modifier = Modifier
+                        .weight(0.8f)
+                        .fillMaxHeight()
+                        .background(QuantumCardBg)
+                        .border(1.dp, QuantumBorder, RoundedCornerShape(8.dp))
+                        .padding(12.dp)
+                ) {
+                    if (selectedItem == null) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "SELECT OBJECT FOR DETAIL TELEMETRY",
+                                color = QuantumGrayText,
+                                textAlign = TextAlign.Center,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    } else {
+                        Column(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .verticalScroll(rememberScrollState())
+                            ) {
+                                // Dynamic isometric hologram of item
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(100.dp)
+                                        .background(QuantumDarkBg, RoundedCornerShape(6.dp))
+                                        .border(1.dp, QuantumBorder, RoundedCornerShape(6.dp)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    // Animated pulse effect
+                                    val infiniteTransition = rememberInfiniteTransition()
+                                    val pulse by infiniteTransition.animateFloat(
+                                        initialValue = 0.9f,
+                                        targetValue = 1.1f,
+                                        animationSpec = infiniteRepeatable(
+                                            animation = tween(1200, easing = LinearEasing),
+                                            repeatMode = RepeatMode.Reverse
+                                        )
+                                    )
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.Center
+                                    ) {
+                                        Text(
+                                            text = selectedItem.iconSymbol,
+                                            fontSize = 40.sp,
+                                            modifier = Modifier.graphicsLayer {
+                                                scaleX = pulse
+                                                scaleY = pulse
+                                            }
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = selectedItem.category.uppercase(),
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                color = QuantumNeonPurple,
+                                                fontSize = 8.sp,
+                                                letterSpacing = 1.sp
+                                            )
+                                        )
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(12.dp))
+
+                                Text(
+                                    text = selectedItem.name,
+                                    style = MaterialTheme.typography.titleSmall.copy(
+                                        color = QuantumLightText,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+
+                                Spacer(modifier = Modifier.height(4.dp))
+
+                                Text(
+                                    text = selectedItem.description,
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = QuantumGrayText,
+                                        lineHeight = 16.sp
+                                    )
+                                )
+
+                                if (selectedItem.statModifierDesc.isNotEmpty()) {
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Text(
+                                        text = "STAT MODIFIERS",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = QuantumNeonBlue,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                    Text(
+                                        text = selectedItem.statModifierDesc,
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = QuantumNeonGreen,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    )
+                                }
+                            }
+
+                            // Actions
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (selectedItem.isConsumable) {
+                                    Button(
+                                        onClick = { viewModel.consumeInventoryItem(selectedItem.id) },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("consume_button"),
+                                        colors = ButtonDefaults.buttonColors(containerColor = QuantumNeonGreen)
+                                    ) {
+                                        Text(
+                                            text = "CONSUME MODULE",
+                                            color = QuantumDarkBg,
+                                            fontWeight = FontWeight.Bold,
+                                            letterSpacing = 1.sp
+                                        )
+                                    }
+                                } else if (selectedItem.isEquippable) {
+                                    val isEquipped = selectedItem.isEquipped
+                                    Button(
+                                        onClick = { viewModel.equipInventoryItem(selectedItem.id) },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("equip_button"),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (isEquipped) QuantumNeonRed else QuantumNeonBlue
+                                        )
+                                    ) {
+                                        Text(
+                                            text = if (isEquipped) "UNEQUIP CORE" else "EQUIP AUXILIARY CORE",
+                                            color = QuantumDarkBg,
+                                            fontWeight = FontWeight.Bold,
+                                            letterSpacing = 1.sp
+                                        )
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = { /* Do nothing */ },
+                                        enabled = false,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = QuantumBorder,
+                                            disabledContainerColor = QuantumBorder
+                                        )
+                                    ) {
+                                        Text(
+                                            text = "RESOURCE MATS",
+                                            color = QuantumGrayText,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ColonyHubView(
+    viewModel: GameViewModel,
+    gameState: GameState,
+    selectedBiome: Biome,
+    playerX: Float,
+    playerY: Float,
+    obstacles: androidx.compose.runtime.snapshots.SnapshotStateList<IsoObstacle>,
+    ticks: Int,
+    particles: androidx.compose.runtime.snapshots.SnapshotStateList<IsoParticle>,
+    damageNumbers: androidx.compose.runtime.snapshots.SnapshotStateList<IsoDamageNumber>
+) {
+    var selectedSubTab by remember { mutableStateOf(0) } // 0 = Base Command, 1 = Crafting, 2 = Pets
+    var statusMessage by remember { mutableStateOf("") }
+    var statusColor by remember { mutableStateOf(QuantumNeonGreen) }
+
+    // Fetch materials
+    val alloyPlateQty = gameState.inventory.find { it.name == "Alloy Plate" }?.quantity ?: 0
+    val nanoFiberQty = gameState.inventory.find { it.name == "Nano Fiber" }?.quantity ?: 0
+    val voidCrystalQty = gameState.inventory.find { it.name == "Void Crystal" }?.quantity ?: 0
+    val quantumCoreQty = gameState.inventory.find { it.name == "Quantum Core" }?.quantity ?: 0
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(QuantumDarkBg)
+            .padding(12.dp)
+    ) {
+        // --- 1. Colony Status Header ---
+        CyberCard(
+            borderColor = QuantumNeonGreen,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "🛰️ COLONY COMMAND OPS CENTER",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            color = QuantumNeonGreen,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    )
+                    Text(
+                        text = "CYCLES SYNCHRONIZED • BIOME: ${selectedBiome.displayName.uppercase()}",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = QuantumGrayText,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    )
+                }
+
+                // Cycle Advancer button
+                Button(
+                    onClick = {
+                        viewModel.advanceTimeAndProduce { credits, nanites ->
+                            if (credits > 0 || nanites > 0) {
+                                statusMessage = "COLONY HARVEST COMPLETE: +$credits Cr, +$nanites Nnt! +50 XP!"
+                                statusColor = QuantumNeonGreen
+                                // Add particles
+                                repeat(10) {
+                                    particles.add(
+                                        IsoParticle(
+                                            x = playerX + Random.nextInt(-30, 30),
+                                            y = playerY + Random.nextInt(-30, 30),
+                                            vx = Random.nextFloat() * 4f - 2f,
+                                            vy = Random.nextFloat() * 4f - 2f,
+                                            color = QuantumNeonGreen,
+                                            size = 3f,
+                                            life = 40
+                                        )
+                                    )
+                                }
+                            } else {
+                                statusMessage = "CYCLE ADVANCED: No active production stations deployed."
+                                statusColor = QuantumNeonOrange
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = QuantumNeonGreen),
+                    modifier = Modifier.height(36.dp).testTag("advance_cycle_button")
+                ) {
+                    Text(
+                        text = "⚡ CYCLE HARVEST",
+                        color = QuantumDarkBg,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = "💵 CREDITS: ${gameState.credits}",
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "🔮 NANITES: ${gameState.nanites}",
+                    color = QuantumNeonPurple,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
+                )
+                // Active pet display
+                val activePet = gameState.deployedStructures.find { it.type == "PET_ADOPTED" && it.isUpgraded }
+                Text(
+                    text = "🐾 ACTIVE PET: ${activePet?.let { "${it.factionName} ${it.name} (LVL ${it.level})" } ?: "NONE"}",
+                    color = QuantumNeonBlue,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            if (statusMessage.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = statusMessage,
+                    color = statusColor,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // --- 2. Subtab Navigation ---
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            val subtabs = listOf("🏗️ BASE COMMAND", "⚙️ ASSEMBLER", "🐾 PET NURSERY")
+            subtabs.forEachIndexed { idx, label ->
+                val isSelected = selectedSubTab == idx
+                val tabColor = when (idx) {
+                    0 -> QuantumNeonGreen
+                    1 -> QuantumNeonOrange
+                    else -> QuantumNeonBlue
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { selectedSubTab = idx }
+                        .background(
+                            if (isSelected) tabColor.copy(alpha = 0.15f) else Color.Transparent,
+                            RoundedCornerShape(6.dp)
+                        )
+                        .border(
+                            BorderStroke(1.dp, if (isSelected) tabColor else QuantumBorder),
+                            RoundedCornerShape(6.dp)
+                        )
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = label,
+                        color = if (isSelected) tabColor else QuantumGrayText,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // --- 3. Subtab Contents ---
+        Box(modifier = Modifier.weight(1f)) {
+            when (selectedSubTab) {
+                0 -> {
+                    // --- BASE BUILDER TAB ---
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        item {
+                            Text(
+                                text = "STRUCTURAL EXPANSION DEPLOYMENT",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = QuantumNeonGreen,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            )
+                        }
+
+                        val buildingsToBuild = listOf(
+                            Triple("⛺ Safe Shelter Dome", "BUILDING_SHELTER", "Establishes a safe pressurized sector retreat. Yields passive credit streams.\nCost: 250 Cr, 50 Nnt"),
+                            Triple("🏗️ Nanite Harvester Rig", "BUILDING_HARVESTER", "Heavy atmospheric rig harvesting localized nanite compounds.\nCost: 300 Cr, 80 Nnt"),
+                            Triple("💎 Credits Fabricator", "BUILDING_FABRICATOR", "Synthesizes quantum credits directly via antimatter loop nodes.\nCost: 350 Cr, 100 Nnt"),
+                            Triple("🐾 Biomechanical Nursery", "BUILDING_NURSERY", "Specialized tech-kennel structure. Unlocks cyber pet adoptions.\nCost: 400 Cr, 120 Nnt"),
+                            Triple("🏢 Command HQ Tower", "BUILDING_HQ", "Primary base command tower. Boosts all other production station yields by +25% per level.\nCost: 600 Cr, 200 Nnt")
+                        )
+
+                        items(buildingsToBuild) { (title, renderType, desc) ->
+                            val creditsCost = when (renderType) {
+                                "BUILDING_SHELTER" -> 250
+                                "BUILDING_HARVESTER" -> 300
+                                "BUILDING_FABRICATOR" -> 350
+                                "BUILDING_NURSERY" -> 400
+                                "BUILDING_HQ" -> 600
+                                else -> 200
+                            }
+                            val nanitesCost = when (renderType) {
+                                "BUILDING_SHELTER" -> 50
+                                "BUILDING_HARVESTER" -> 80
+                                "BUILDING_FABRICATOR" -> 100
+                                "BUILDING_NURSERY" -> 120
+                                "BUILDING_HQ" -> 200
+                                else -> 50
+                            }
+
+                            val canBuild = gameState.credits >= creditsCost && gameState.nanites >= nanitesCost
+                            val isHq = renderType == "BUILDING_HQ"
+                            val hqAlreadyExists = gameState.deployedStructures.any { it.type == "BUILDING_HQ" }
+                            val isBuildDisabled = isHq && hqAlreadyExists
+
+                            CyberCard(borderColor = QuantumNeonGreen) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = title.uppercase(),
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            text = desc,
+                                            fontSize = 9.sp,
+                                            color = QuantumLightText,
+                                            lineHeight = 12.sp
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.width(8.dp))
+
+                                    Button(
+                                        onClick = {
+                                            if (canBuild) {
+                                                viewModel.deployArchitecture(
+                                                    Faction.IRONWARD,
+                                                    creditsCost,
+                                                    nanitesCost,
+                                                    200,
+                                                    30,
+                                                    DeployedStructure(
+                                                        System.nanoTime(),
+                                                        renderType,
+                                                        title.substring(2),
+                                                        "Ironward",
+                                                        selectedBiome.name,
+                                                        playerX,
+                                                        playerY,
+                                                        QuantumNeonGreen.value.toLong(),
+                                                        false,
+                                                        1
+                                                    )
+                                                )
+                                                // Spark particles
+                                                repeat(15) {
+                                                    particles.add(
+                                                        IsoParticle(
+                                                            x = playerX,
+                                                            y = playerY,
+                                                            vx = Random.nextFloat() * 6f - 3f,
+                                                            vy = Random.nextFloat() * 6f - 3f,
+                                                            color = QuantumNeonGreen,
+                                                            size = 4f,
+                                                            life = 35
+                                                        )
+                                                    )
+                                                }
+                                                damageNumbers.add(
+                                                    IsoDamageNumber(
+                                                        id = System.nanoTime(),
+                                                        text = "STRUCTURE DEPLOYED!",
+                                                        x = playerX,
+                                                        y = playerY - 30f,
+                                                        color = QuantumNeonGreen
+                                                    )
+                                                )
+                                                statusMessage = "DEPLOYED SUCCESS: ${title} built at current coordinates!"
+                                                statusColor = QuantumNeonGreen
+                                            }
+                                        },
+                                        enabled = canBuild && !isBuildDisabled,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = QuantumNeonGreen,
+                                            disabledContainerColor = QuantumBorder
+                                        ),
+                                        modifier = Modifier.height(36.dp).testTag("deploy_${renderType}")
+                                    ) {
+                                        Text(
+                                            text = if (isBuildDisabled) "LIMIT 1" else "BUILD",
+                                            color = if (canBuild && !isBuildDisabled) QuantumDarkBg else QuantumGrayText,
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        item {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "ACTIVE STATION REGISTRY",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = QuantumNeonGreen,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            )
+                        }
+
+                        val activeStations = gameState.deployedStructures.filter {
+                            it.type.startsWith("BUILDING_")
+                        }
+
+                        if (activeStations.isEmpty()) {
+                            item {
+                                Text(
+                                    text = "No production or shelter stations active. Place stations on the grid above.",
+                                    color = QuantumGrayText,
+                                    fontSize = 9.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.padding(vertical = 12.dp)
+                                )
+                            }
+                        } else {
+                            items(activeStations) { ds ->
+                                val upgradeCreditsCost = 150 * ds.level
+                                val upgradeNanitesCost = 50 * ds.level
+                                val canUpgrade = gameState.credits >= upgradeCreditsCost && gameState.nanites >= upgradeNanitesCost
+
+                                CyberCard(borderColor = QuantumNeonGreen) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column {
+                                            Text(
+                                                text = "${ds.name.uppercase()} [LVL ${ds.level}]",
+                                                fontSize = 11.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Bold,
+                                                color = QuantumNeonGreen
+                                            )
+                                            Text(
+                                                text = "Sector: ${ds.biomeName} • X: ${ds.x.roundToInt()} Y: ${ds.y.roundToInt()}",
+                                                fontSize = 8.sp,
+                                                color = QuantumGrayText,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                            val currentYield = when (ds.type) {
+                                                "BUILDING_SHELTER" -> "Generates 15 Credits per cycle"
+                                                "BUILDING_HARVESTER" -> "Extracts ${12 * ds.level} Nanites per cycle"
+                                                "BUILDING_FABRICATOR" -> "Synthesizes ${60 * ds.level} Credits per cycle"
+                                                "BUILDING_HQ" -> "All base production +${(ds.level - 1) * 25}%"
+                                                else -> "Active base shelter"
+                                            }
+                                            Text(
+                                                text = currentYield,
+                                                fontSize = 9.sp,
+                                                color = QuantumLightText
+                                            )
+                                        }
+
+                                        Button(
+                                            onClick = {
+                                                if (canUpgrade) {
+                                                    viewModel.upgradeDeployedStructure(ds.id, upgradeCreditsCost, upgradeNanitesCost)
+                                                    statusMessage = "UPGRADED: ${ds.name} level raised to ${ds.level + 1}!"
+                                                    statusColor = QuantumNeonGreen
+                                                }
+                                            },
+                                            enabled = canUpgrade,
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = QuantumNeonGreen,
+                                                disabledContainerColor = QuantumBorder
+                                            ),
+                                            modifier = Modifier.height(32.dp).testTag("upgrade_${ds.id}")
+                                        ) {
+                                            Text(
+                                                text = "UPGRADE (${upgradeCreditsCost} Cr)",
+                                                color = if (canUpgrade) QuantumDarkBg else QuantumGrayText,
+                                                fontSize = 8.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                fontFamily = FontFamily.Monospace
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                1 -> {
+                    // --- CRAFTING ASSEMBLER TAB ---
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        item {
+                            // Raw Materials Inventory
+                            CyberCard(borderColor = QuantumNeonOrange) {
+                                Text(
+                                    text = "SECURED ASSEMBLER COMPONENTS",
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = QuantumNeonOrange,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column {
+                                        Text(text = "⚙️ Alloy Plates: $alloyPlateQty", fontSize = 10.sp, color = Color.White, fontFamily = FontFamily.Monospace)
+                                        Text(text = "🧵 Nano Fibers: $nanoFiberQty", fontSize = 10.sp, color = Color.White, fontFamily = FontFamily.Monospace)
+                                    }
+                                    Column {
+                                        Text(text = "🔮 Void Crystals: $voidCrystalQty", fontSize = 10.sp, color = Color.White, fontFamily = FontFamily.Monospace)
+                                        Text(text = "🌀 Quantum Cores: $quantumCoreQty", fontSize = 10.sp, color = Color.White, fontFamily = FontFamily.Monospace)
+                                    }
+                                }
+                            }
+                        }
+
+                        item {
+                            Text(
+                                text = "BIOMECHANICAL EQUIPMENT RECIPES",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = QuantumNeonOrange,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            )
+                        }
+
+                        val recipes = listOf(
+                            // recipeName, symbol, desc, credits, nanites, materialsNeed, resultCategory, isCons, isEquip
+                            listOf("Chrono Shield Generator", "🛡️", "Advanced electromagnetic accessory shield.\n+150 HP, +50 Defense.", "100", "25", "Alloy Plate:2,Nano Fiber:1", "Equipment", "0", "150", "0", "0", "50", "false", "true"),
+                            listOf("Quantum Plasma Blade", "⚔️", "Searing arc blade forged in plasma loops.\n+45 Attack.", "150", "40", "Alloy Plate:3,Quantum Core:1", "Equipment", "0", "0", "0", "45", "0", "false", "true"),
+                            listOf("Void Resonance Core", "🌀", "Dark-energy focusing core auxiliary module.\n+80 Tech, +100 Max MP.", "200", "60", "Void Crystal:2,Quantum Core:1", "Equipment", "0", "0", "100", "0", "10", "false", "true"),
+                            listOf("Hyper Nanite Injector", "🧪", "Instant cellular restructuring injector.\nFully heals 200 HP.", "50", "15", "Nano Fiber:2,Void Crystal:1", "Medicine", "1", "200", "0", "0", "0", "true", "false")
+                        )
+
+                        items(recipes) { recipe ->
+                            val rName = recipe[0]
+                            val rSymbol = recipe[1]
+                            val rDesc = recipe[2]
+                            val rCredits = recipe[3].toInt()
+                            val rNanites = recipe[4].toInt()
+                            val rMatStr = recipe[5]
+                            val rCategory = recipe[6]
+                            val rHp = recipe[8].toInt()
+                            val rMp = recipe[9].toInt()
+                            val rAtk = recipe[10].toInt()
+                            val rDef = recipe[11].toInt()
+                            val rIsCons = recipe[12].toBoolean()
+                            val rIsEquip = recipe[13].toBoolean()
+
+                            // Parse ingredients
+                            val ingredients = rMatStr.split(",").map {
+                                val s = it.split(":")
+                                Pair(s[0], s[1].toInt())
+                            }
+
+                            // Check requirements
+                            var hasMats = true
+                            val reqStrings = mutableListOf<String>()
+                            ingredients.forEach { (matName, needed) ->
+                                val currentQty = gameState.inventory.find { it.name == matName }?.quantity ?: 0
+                                reqStrings.add("$matName ($currentQty/$needed)")
+                                if (currentQty < needed) {
+                                    hasMats = false
+                                }
+                            }
+
+                            val hasResources = gameState.credits >= rCredits && gameState.nanites >= rNanites
+                            val canCraft = hasMats && hasResources
+
+                            CyberCard(borderColor = QuantumNeonOrange) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "$rSymbol ${rName.uppercase()}",
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold,
+                                            color = QuantumNeonOrange
+                                        )
+                                        Text(
+                                            text = rDesc,
+                                            fontSize = 9.sp,
+                                            color = QuantumLightText,
+                                            lineHeight = 12.sp
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "Req: ${reqStrings.joinToString(", ")} • Cost: $rCredits Cr / $rNanites Nnt",
+                                            fontSize = 8.sp,
+                                            color = if (canCraft) QuantumNeonGreen else QuantumGrayText,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+
+                                    Button(
+                                        onClick = {
+                                            if (canCraft) {
+                                                viewModel.craftItem(
+                                                    rName,
+                                                    rCredits,
+                                                    rNanites,
+                                                    ingredients,
+                                                    rName,
+                                                    rCategory,
+                                                    rSymbol,
+                                                    rDesc,
+                                                    rHp,
+                                                    rMp,
+                                                    rAtk,
+                                                    rDef,
+                                                    rIsCons,
+                                                    rIsEquip
+                                                )
+                                                // Particles
+                                                repeat(15) {
+                                                    particles.add(
+                                                        IsoParticle(
+                                                            x = playerX,
+                                                            y = playerY,
+                                                            vx = Random.nextFloat() * 5f - 2.5f,
+                                                            vy = Random.nextFloat() * 5f - 2.5f,
+                                                            color = QuantumNeonOrange,
+                                                            size = 3.5f,
+                                                            life = 35
+                                                        )
+                                                    )
+                                                }
+                                                damageNumbers.add(
+                                                    IsoDamageNumber(
+                                                        id = System.nanoTime(),
+                                                        text = "CRAFTED: ${rName.uppercase()}!",
+                                                        x = playerX,
+                                                        y = playerY - 35f,
+                                                        color = QuantumNeonOrange
+                                                    )
+                                                )
+                                                statusMessage = "CRAFT SUCCESS: Crafted 1x $rName into inventory!"
+                                                statusColor = QuantumNeonOrange
+                                            }
+                                        },
+                                        enabled = canCraft,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = QuantumNeonOrange,
+                                            disabledContainerColor = QuantumBorder
+                                        ),
+                                        modifier = Modifier.height(34.dp).testTag("craft_${rName.replace(" ", "_")}")
+                                    ) {
+                                        Text(
+                                            text = "ASSEMBLE",
+                                            color = if (canCraft) QuantumDarkBg else QuantumGrayText,
+                                            fontSize = 8.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                2 -> {
+                    // --- PET NURSERY TAB ---
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        item {
+                            Text(
+                                text = "BIOMECHANICAL NURSERY & ADOPTION",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = QuantumNeonBlue,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            )
+                        }
+
+                        val petsAvailable = listOf(
+                            Triple("Aero-Pup", "🐕", "Biomechanical golden retriever watch-hound.\nPassive: +15% Credits & Nanites gathering cycle bonus.\nCost: 200 Cr, 50 Nnt"),
+                            Triple("Laser-Whiskers", "🐈", "Sleek cybernetic scanner kitten with sound whiskers.\nPassive: +15% Credits & Nanites gathering cycle bonus.\nCost: 250 Cr, 60 Nnt"),
+                            Triple("Rust-Tooth", "🦖", "Miniature cybernetic armored T-Rex auxiliary sentinel.\nPassive: +15% Credits & Nanites gathering cycle bonus.\nCost: 400 Cr, 100 Nnt"),
+                            Triple("Beep-Boop", "🛸", "Floating magnetic levitation service helper drone.\nPassive: +15% Credits & Nanites gathering cycle bonus.\nCost: 180 Cr, 40 Nnt")
+                        )
+
+                        items(petsAvailable) { (petName, emoji, petDesc) ->
+                            val creditsCost = when (petName) {
+                                "Aero-Pup" -> 200
+                                "Laser-Whiskers" -> 250
+                                "Rust-Tooth" -> 400
+                                "Beep-Boop" -> 180
+                                else -> 200
+                            }
+                            val nanitesCost = when (petName) {
+                                "Aero-Pup" -> 50
+                                "Laser-Whiskers" -> 60
+                                "Rust-Tooth" -> 100
+                                "Beep-Boop" -> 40
+                                else -> 50
+                            }
+
+                            val alreadyAdopted = gameState.deployedStructures.any {
+                                it.type == "PET_ADOPTED" && it.name == petName
+                            }
+
+                            val canAdopt = gameState.credits >= creditsCost && gameState.nanites >= nanitesCost && !alreadyAdopted
+
+                            CyberCard(borderColor = QuantumNeonBlue) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "$emoji ${petName.uppercase()}",
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold,
+                                            color = QuantumNeonBlue
+                                        )
+                                        Text(
+                                            text = petDesc,
+                                            fontSize = 9.sp,
+                                            color = QuantumLightText,
+                                            lineHeight = 12.sp
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.width(8.dp))
+
+                                    Button(
+                                        onClick = {
+                                            if (canAdopt) {
+                                                viewModel.adoptPet(petName, emoji, creditsCost, nanitesCost)
+                                                // Particles
+                                                repeat(15) {
+                                                    particles.add(
+                                                        IsoParticle(
+                                                            x = playerX,
+                                                            y = playerY,
+                                                            vx = Random.nextFloat() * 4f - 2f,
+                                                            vy = Random.nextFloat() * 4f - 2f,
+                                                            color = QuantumNeonBlue,
+                                                            size = 3.5f,
+                                                            life = 35
+                                                        )
+                                                    )
+                                                }
+                                                damageNumbers.add(
+                                                    IsoDamageNumber(
+                                                        id = System.nanoTime(),
+                                                        text = "${petName.uppercase()} ADOPTED!",
+                                                        x = playerX,
+                                                        y = playerY - 30f,
+                                                        color = QuantumNeonBlue
+                                                    )
+                                                )
+                                                statusMessage = "ADOPT SUCCESS: $petName adopted! Configure it below."
+                                                statusColor = QuantumNeonBlue
+                                            }
+                                        },
+                                        enabled = canAdopt,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = QuantumNeonBlue,
+                                            disabledContainerColor = QuantumBorder
+                                        ),
+                                        modifier = Modifier.height(34.dp).testTag("adopt_${petName}")
+                                    ) {
+                                        Text(
+                                            text = if (alreadyAdopted) "OWNED" else "ADOPT",
+                                            color = if (canAdopt) QuantumDarkBg else QuantumGrayText,
+                                            fontSize = 8.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        item {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "RETRIEVED NUCLEUS PETS (NURSERY KENNEL)",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = QuantumNeonBlue,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            )
+                        }
+
+                        val adoptedPets = gameState.deployedStructures.filter { it.type == "PET_ADOPTED" }
+
+                        if (adoptedPets.isEmpty()) {
+                            item {
+                                Text(
+                                    text = "No adopted biomechanical pets yet. Adopt a pet above using credits and nanites.",
+                                    color = QuantumGrayText,
+                                    fontSize = 9.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.padding(vertical = 12.dp)
+                                )
+                            }
+                        } else {
+                            items(adoptedPets) { pet ->
+                                val trainCreditsCost = 100 * pet.level
+                                val trainNanitesCost = 30 * pet.level
+                                val canTrain = gameState.credits >= trainCreditsCost && gameState.nanites >= trainNanitesCost
+                                val isActive = pet.isUpgraded // used for active status
+
+                                CyberCard(borderColor = if (isActive) QuantumNeonBlue else QuantumBorder) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(
+                                                    text = "${pet.factionName} ${pet.name.uppercase()} [LVL ${pet.level}]",
+                                                    fontSize = 11.sp,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = if (isActive) QuantumNeonBlue else Color.White
+                                                )
+                                                if (isActive) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(
+                                                        text = "ACTIVE COMPANION",
+                                                        fontSize = 8.sp,
+                                                        color = QuantumNeonGreen,
+                                                        fontFamily = FontFamily.Monospace,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier
+                                                            .background(QuantumNeonGreen.copy(alpha = 0.12f), RoundedCornerShape(2.dp))
+                                                            .border(0.5.dp, QuantumNeonGreen, RoundedCornerShape(2.dp))
+                                                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                                                    )
+                                                }
+                                            }
+                                            val currentBonus = 15 + (pet.level * 15)
+                                            Text(
+                                                text = "Harvest Gather Bonus: +${currentBonus}% (increases with Level)",
+                                                fontSize = 9.sp,
+                                                color = QuantumLightText
+                                            )
+                                        }
+
+                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            if (!isActive) {
+                                                Button(
+                                                    onClick = {
+                                                        viewModel.setActivePet(pet.id)
+                                                        statusMessage = "${pet.name} activated! It will follow you in the Field."
+                                                        statusColor = QuantumNeonBlue
+                                                    },
+                                                    colors = ButtonDefaults.buttonColors(containerColor = QuantumNeonBlue),
+                                                    modifier = Modifier.height(30.dp).testTag("activate_${pet.id}")
+                                                ) {
+                                                    Text(
+                                                        text = "DEPLOY",
+                                                        color = QuantumDarkBg,
+                                                        fontSize = 8.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        fontFamily = FontFamily.Monospace
+                                                    )
+                                                }
+                                            }
+
+                                            Button(
+                                                onClick = {
+                                                    if (canTrain) {
+                                                        viewModel.trainPet(pet.id, trainCreditsCost, trainNanitesCost)
+                                                        statusMessage = "TRAINING SUCCESS: ${pet.name} leveled up to Level ${pet.level + 1}!"
+                                                        statusColor = QuantumNeonBlue
+                                                    }
+                                                },
+                                                enabled = canTrain,
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = QuantumNeonOrange,
+                                                    disabledContainerColor = QuantumBorder
+                                                ),
+                                                modifier = Modifier.height(30.dp).testTag("train_${pet.id}")
+                                            ) {
+                                                Text(
+                                                    text = "TRAIN (${trainCreditsCost} Cr)",
+                                                    color = if (canTrain) QuantumDarkBg else QuantumGrayText,
+                                                    fontSize = 8.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    fontFamily = FontFamily.Monospace
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
