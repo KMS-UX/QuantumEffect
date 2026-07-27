@@ -1,7 +1,5 @@
 package com.example.game.db
 
-import androidx.compose.animation.core.AnimationConstants
-import androidx.compose.runtime.ComposerKt
 import com.example.game.models.*
 import com.squareup.moshi.JsonAdapter
 import com.squareup.moshi.Moshi
@@ -43,34 +41,34 @@ class GameRepository(val dao: GameProgressDao) {
     }
 
     val augmentList: List<AugmentChip> = listOf(
-        AugmentChip("Neural Processor", AugmentSlot.CRANIAL, "+15 ATK, overclock mental reasoning", 0, 0, 15, 0, 10, 0, 0, 856),
-        AugmentChip("Memory Expansion", AugmentSlot.CRANIAL, "+40 MP, increases timeline recall", 0, 40, 0, 0, 0, 0, 0, 1000),
-        AugmentChip("Focus Amplifier", AugmentSlot.CRANIAL, "+20 MAG, concentrates resonance waves", 0, 0, 0, 0, 20, 0, 0, 888),
-        AugmentChip("Vision Suite", AugmentSlot.CRANIAL, "+10 LCK, highlights tactical anomalies", 0, 0, 0, 0, 0, 0, 10, 504),
-        AugmentChip("Signal Heart", AugmentSlot.TORSO, "+100 HP, enhances adrenaline pumps", 100, 0, 0, 0, 0, 0, 0, 511),
-        AugmentChip("Lung Reinforcement", AugmentSlot.TORSO, "+20 DEF, mitigates toxic atmospheres", 0, 0, 0, 20, 0, 0, 0, 952),
-        AugmentChip("Nano Fiber Mesh", AugmentSlot.TORSO, "+50 HP, absorbing kinetic shock", 50, 0, 0, 10, 0, 0, 0, 944),
-        AugmentChip("Bio-Reactor", AugmentSlot.TORSO, "+20 MP & +15 ATK, fuels biomechanics", 0, 20, 15, 0, 0, 0, 0, 968),
-        AugmentChip("Cybernetic Muscles", AugmentSlot.ARMS, "+30 ATK, hydraulic punches", 0, 0, 30, 0, 0, 0, 0, 984),
-        AugmentChip("Smart Servo-Joint", AugmentSlot.ARMS, "+15 SPD, quick combat draw", 0, 0, 0, 0, 0, 15, 0, 760),
-        AugmentChip("Tactical Interface", AugmentSlot.ARMS, "+15 ATK & +10 MAG, lock-on targeting", 0, 0, 15, 0, 10, 0, 0, 856),
-        AugmentChip("Weapon Mount", AugmentSlot.ARMS, "+25 ATK, heavy stabilizer chassis", 0, 0, 25, 0, 0, 0, 0, 984),
-        AugmentChip("Magnetic Boosters", AugmentSlot.LEGS, "+25 SPD, slide on scrap metals", 0, 0, 0, 0, 0, 25, 0, 760),
-        AugmentChip("Shock Absorbers", AugmentSlot.LEGS, "+50 HP, safe leap down from buildings", 50, 0, 0, 0, 0, 0, 0, 511),
-        AugmentChip("Graviton Stabilizer", AugmentSlot.LEGS, "+15 DEF & +10 LCK, gravity defying steps", 0, 0, 0, 15, 0, 0, 10, 440),
-        AugmentChip("Silent Step System", AugmentSlot.LEGS, "+20 SPD, sound dampening soles", 0, 0, 0, 0, 0, 20, 0, 760),
-        AugmentChip("Quantum Eye", AugmentSlot.SENSORY, "+30 MAG, sees light wave emissions", 0, 0, 0, 0, 30, 0, 0, 888),
-        AugmentChip("Audio Enhancer", AugmentSlot.SENSORY, "+10 SPD & +10 LCK, listens to radio bands", 0, 0, 0, 0, 0, 10, 10, 248),
-        AugmentChip("Threat Scanner", AugmentSlot.SENSORY, "+15 DEF, tactical danger overlay", 0, 0, 0, 15, 0, 0, 0, 952),
-        AugmentChip("Datajack", AugmentSlot.SENSORY, "+15 MAG, instant network link", 0, 0, 0, 0, 15, 0, 0, 888),
-        AugmentChip("Adaptive Armor Skin", AugmentSlot.DERMAL, "+30 DEF, scales resist bullets", 0, 0, 0, 30, 0, 0, 0, 952),
-        AugmentChip("Thermal Regulation", AugmentSlot.DERMAL, "+50 HP, works in lava/glacier biomes", 50, 0, 0, 0, 0, 0, 0, 511),
-        AugmentChip("Nano-Heal Layer", AugmentSlot.DERMAL, "Regenerates HP constantly, +15 DEF", 0, 0, 0, 15, 0, 0, 0, 952),
-        AugmentChip("Camouflage Mesh", AugmentSlot.DERMAL, "+15 SPD, adapts color to shadows", 0, 0, 0, 0, 0, 15, 0, 760),
-        AugmentChip("Resonance Core", AugmentSlot.QUANTUM_CORE, "+20 ATK, +20 MAG, stable alignment", 0, 0, 20, 0, 20, 0, 0, 856),
-        AugmentChip("Quantum Capacitor", AugmentSlot.QUANTUM_CORE, "+50 MP, condensed energy pool", 0, 50, 0, 0, 0, 0, 0, 1000),
-        AugmentChip("Energy Conduit", AugmentSlot.QUANTUM_CORE, "+100 HP, rapid current distribution", 100, 0, 0, 0, 0, 0, 0, 511),
-        AugmentChip("Warp Stabilizer", AugmentSlot.QUANTUM_CORE, "+15 LCK, keeps coordinates safe", 0, 0, 0, 0, 0, 0, 15, 504)
+        AugmentChip("Neural Processor", AugmentSlot.CRANIAL, "+15 ATK, overclock mental reasoning", 0, 0, 15, 0, 10, 0, 0),
+        AugmentChip("Memory Expansion", AugmentSlot.CRANIAL, "+40 MP, increases timeline recall", 0, 40, 0, 0, 0, 0, 0),
+        AugmentChip("Focus Amplifier", AugmentSlot.CRANIAL, "+20 MAG, concentrates resonance waves", 0, 0, 0, 0, 20, 0, 0),
+        AugmentChip("Vision Suite", AugmentSlot.CRANIAL, "+10 LCK, highlights tactical anomalies", 0, 0, 0, 0, 0, 0, 10),
+        AugmentChip("Signal Heart", AugmentSlot.TORSO, "+100 HP, enhances adrenaline pumps", 100, 0, 0, 0, 0, 0, 0),
+        AugmentChip("Lung Reinforcement", AugmentSlot.TORSO, "+20 DEF, mitigates toxic atmospheres", 0, 0, 0, 20, 0, 0, 0),
+        AugmentChip("Nano Fiber Mesh", AugmentSlot.TORSO, "+50 HP, absorbing kinetic shock", 50, 0, 0, 10, 0, 0, 0),
+        AugmentChip("Bio-Reactor", AugmentSlot.TORSO, "+20 MP & +15 ATK, fuels biomechanics", 0, 20, 15, 0, 0, 0, 0),
+        AugmentChip("Cybernetic Muscles", AugmentSlot.ARMS, "+30 ATK, hydraulic punches", 0, 0, 30, 0, 0, 0, 0),
+        AugmentChip("Smart Servo-Joint", AugmentSlot.ARMS, "+15 SPD, quick combat draw", 0, 0, 0, 0, 0, 15, 0),
+        AugmentChip("Tactical Interface", AugmentSlot.ARMS, "+15 ATK & +10 MAG, lock-on targeting", 0, 0, 15, 0, 10, 0, 0),
+        AugmentChip("Weapon Mount", AugmentSlot.ARMS, "+25 ATK, heavy stabilizer chassis", 0, 0, 25, 0, 0, 0, 0),
+        AugmentChip("Magnetic Boosters", AugmentSlot.LEGS, "+25 SPD, slide on scrap metals", 0, 0, 0, 0, 0, 25, 0),
+        AugmentChip("Shock Absorbers", AugmentSlot.LEGS, "+50 HP, safe leap down from buildings", 50, 0, 0, 0, 0, 0, 0),
+        AugmentChip("Graviton Stabilizer", AugmentSlot.LEGS, "+15 DEF & +10 LCK, gravity defying steps", 0, 0, 0, 15, 0, 0, 10),
+        AugmentChip("Silent Step System", AugmentSlot.LEGS, "+20 SPD, sound dampening soles", 0, 0, 0, 0, 0, 20, 0),
+        AugmentChip("Quantum Eye", AugmentSlot.SENSORY, "+30 MAG, sees light wave emissions", 0, 0, 0, 0, 30, 0, 0),
+        AugmentChip("Audio Enhancer", AugmentSlot.SENSORY, "+10 SPD & +10 LCK, listens to radio bands", 0, 0, 0, 0, 0, 10, 10),
+        AugmentChip("Threat Scanner", AugmentSlot.SENSORY, "+15 DEF, tactical danger overlay", 0, 0, 0, 15, 0, 0, 0),
+        AugmentChip("Datajack", AugmentSlot.SENSORY, "+15 MAG, instant network link", 0, 0, 0, 0, 15, 0, 0),
+        AugmentChip("Adaptive Armor Skin", AugmentSlot.DERMAL, "+30 DEF, scales resist bullets", 0, 0, 0, 30, 0, 0, 0),
+        AugmentChip("Thermal Regulation", AugmentSlot.DERMAL, "+50 HP, works in lava/glacier biomes", 50, 0, 0, 0, 0, 0, 0),
+        AugmentChip("Nano-Heal Layer", AugmentSlot.DERMAL, "Regenerates HP constantly, +15 DEF", 0, 0, 0, 15, 0, 0, 0),
+        AugmentChip("Camouflage Mesh", AugmentSlot.DERMAL, "+15 SPD, adapts color to shadows", 0, 0, 0, 0, 0, 15, 0),
+        AugmentChip("Resonance Core", AugmentSlot.QUANTUM_CORE, "+20 ATK, +20 MAG, stable alignment", 0, 0, 20, 0, 20, 0, 0),
+        AugmentChip("Quantum Capacitor", AugmentSlot.QUANTUM_CORE, "+50 MP, condensed energy pool", 0, 50, 0, 0, 0, 0, 0),
+        AugmentChip("Energy Conduit", AugmentSlot.QUANTUM_CORE, "+100 HP, rapid current distribution", 100, 0, 0, 0, 0, 0, 0),
+        AugmentChip("Warp Stabilizer", AugmentSlot.QUANTUM_CORE, "+15 LCK, keeps coordinates safe", 0, 0, 0, 0, 0, 0, 15)
     )
 
     suspend fun getGameState(): GameState = withContext(Dispatchers.IO) {

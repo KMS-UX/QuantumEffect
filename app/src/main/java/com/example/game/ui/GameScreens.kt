@@ -3,6 +3,9 @@ package com.example.game.ui
 import com.example.game.db.*
 import com.example.game.viewmodel.*
 import com.example.game.api.WebSource
+import com.example.game.engine.IsoDirection
+import com.example.game.engine.IsometricMath
+import com.example.game.engine.Vec2
 import com.example.ui.theme.*
 import com.example.game.models.*
 import androidx.compose.runtime.collectAsState
@@ -320,6 +323,12 @@ fun ExploreScreen(
     var playerY by remember { mutableStateOf(200f) }
     var playerDirX by remember { mutableStateOf(0f) }
     var playerDirY by remember { mutableStateOf(1f) } // Face direction
+
+    // Movement velocity, kept separate from raw input so releasing the stick can
+    // coast to a stop through IsometricMath.applyFriction instead of snapping.
+    var playerVelocity by remember { mutableStateOf(Vec2.ZERO) }
+    // Sprite facing, snapped to one of the eight isometric directions.
+    var playerFacing by remember { mutableStateOf(IsoDirection.DOWN) }
     
     // Dynamic obstacle & interaction lists
     val obstacles = remember { mutableStateListOf<IsoObstacle>() }
@@ -775,10 +784,20 @@ fun ExploreScreen(
                     shieldActiveTime--
                 }
                 
-                if (joystickX != 0f || joystickY != 0f) {
-                    val testX = (playerX + joystickX * speed * delta).coerceIn(30f, 370f)
-                    val testY = (playerY + joystickY * speed * delta).coerceIn(30f, 370f)
-                    
+                // Input drives velocity directly; once it is released the vector
+                // decays exponentially so the sprite eases to a halt (blueprint 3A).
+                playerVelocity = if (joystickX != 0f || joystickY != 0f) {
+                    Vec2(joystickX, joystickY)
+                } else {
+                    IsometricMath.applyFriction(playerVelocity, delta)
+                }
+
+                if (playerVelocity != Vec2.ZERO) {
+                    val moveX = playerVelocity.x
+                    val moveY = playerVelocity.y
+                    val testX = (playerX + moveX * speed * delta).coerceIn(30f, 370f)
+                    val testY = (playerY + moveY * speed * delta).coerceIn(30f, 370f)
+
                     var collides = false
                     for (obs in obstacles) {
                         if (!obs.isDestroyed) {
@@ -797,7 +816,7 @@ fun ExploreScreen(
                     } else {
                         // Sliding collision helper: try X-only
                         var collidesX = false
-                        val testXOnly = (playerX + joystickX * speed * delta).coerceIn(30f, 370f)
+                        val testXOnly = (playerX + moveX * speed * delta).coerceIn(30f, 370f)
                         for (obs in obstacles) {
                             if (!obs.isDestroyed) {
                                 val dx = testXOnly - obs.x
@@ -813,7 +832,7 @@ fun ExploreScreen(
                         } else {
                             // Try Y-only
                             var collidesY = false
-                            val testYOnly = (playerY + joystickY * speed * delta).coerceIn(30f, 370f)
+                            val testYOnly = (playerY + moveY * speed * delta).coerceIn(30f, 370f)
                             for (obs in obstacles) {
                                 if (!obs.isDestroyed) {
                                     val dx = playerX - obs.x
@@ -830,11 +849,12 @@ fun ExploreScreen(
                         }
                     }
                     
-                    val len = sqrt(joystickX * joystickX + joystickY * joystickY)
+                    val len = sqrt(moveX * moveX + moveY * moveY)
                     if (len > 0.05f) {
-                        playerDirX = joystickX / len
-                        playerDirY = joystickY / len
+                        playerDirX = moveX / len
+                        playerDirY = moveY / len
                     }
+                    IsometricMath.snapToOctant(moveX, moveY)?.let { playerFacing = it }
                 }
                 
                 // 2. Slashing sword swing timer
@@ -4562,6 +4582,12 @@ fun ExploreScreen(
                     Text(
                         text = "COORDS: X ${(playerX).roundToInt()} Y ${(playerY).roundToInt()}",
                         color = QuantumLightText,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = "HEADING: ${playerFacing.label.uppercase()}",
+                        color = QuantumGrayText,
                         fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace
                     )

@@ -1,8 +1,31 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
+}
+
+/**
+ * Resolves the Gemini key, in precedence order, from:
+ *   1. a `-PgeminiApiKey=...` Gradle property (or `gradle.properties`)
+ *   2. the `GEMINI_API_KEY` environment variable
+ *   3. a `.env` file in the repository root (see `.env.example`)
+ *
+ * Missing is not fatal: the app builds and runs, and the AI terminals report
+ * that no key is configured rather than crashing.
+ */
+fun resolveGeminiApiKey(): String {
+    (project.findProperty("geminiApiKey") as String?)?.takeIf { it.isNotBlank() }?.let { return it }
+    System.getenv("GEMINI_API_KEY")?.takeIf { it.isNotBlank() }?.let { return it }
+
+    val envFile = rootProject.file(".env")
+    if (envFile.exists()) {
+        val props = Properties().apply { envFile.inputStream().use { load(it) } }
+        props.getProperty("GEMINI_API_KEY")?.takeIf { it.isNotBlank() }?.let { return it }
+    }
+    return ""
 }
 
 android {
@@ -20,6 +43,8 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        buildConfigField("String", "GEMINI_API_KEY", "\"${resolveGeminiApiKey()}\"")
     }
 
     buildTypes {
@@ -79,9 +104,13 @@ dependencies {
     implementation(libs.okhttp.logging)
     implementation(libs.moshi)
     implementation(libs.moshi.kotlin)
+    // Generates the adapters for @JsonClass(generateAdapter = true) DTOs in GeminiApi.kt.
+    ksp(libs.moshi.kotlin.codegen)
 
     // Testing
     testImplementation(libs.junit)
+    testImplementation(libs.kotlin.test.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
