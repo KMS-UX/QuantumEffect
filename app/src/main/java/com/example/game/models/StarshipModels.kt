@@ -73,7 +73,8 @@ data class StarshipState(
     val currentSystemId: String = "sys_sol_prime",
     val universeAlignment: Int = 50,
     val quantumBabiesDiscovered: Int = 0,
-    val activeEndingChoice: String = ""
+    /** Null until the player commits to an ending; cleared back to null to re-choose. */
+    val activeEndingChoice: String? = null
 )
 
 data class SpaceCombatState(

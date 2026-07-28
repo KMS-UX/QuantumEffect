@@ -1563,7 +1563,7 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    fun resolveGameEnding(endingId: String) {
+    fun resolveGameEnding(endingId: String?) {
         _starshipState.value = _starshipState.value.copy(activeEndingChoice = endingId)
     }
 
