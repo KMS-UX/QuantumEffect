@@ -57,7 +57,7 @@ fun QuantumWarpView(
             WarpTransitionScreen(
                 progress = warpProgress,
                 message = warpMessage,
-                targetColor = Color(currentEarth.primaryColor)
+                targetColor = currentEarth.primaryColor
             )
         } else {
             // Main reality station console
@@ -69,7 +69,7 @@ fun QuantumWarpView(
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 // Main Terminal Header
-                CyberCard(borderColor = Color(currentEarth.primaryColor)) {
+                CyberCard(borderColor = currentEarth.primaryColor) {
                     Column(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalAlignment = Alignment.CenterHorizontally
@@ -79,7 +79,7 @@ fun QuantumWarpView(
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
                             fontSize = 18.sp,
-                            color = Color(currentEarth.primaryColor),
+                            color = currentEarth.primaryColor,
                             textAlign = TextAlign.Center
                         )
                         Spacer(modifier = Modifier.height(4.dp))
@@ -96,7 +96,7 @@ fun QuantumWarpView(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .background(Color.Black.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
-                                .border(1.dp, Color(currentEarth.primaryColor).copy(alpha = 0.3f), RoundedCornerShape(4.dp))
+                                .border(1.dp, currentEarth.primaryColor.copy(alpha = 0.3f), RoundedCornerShape(4.dp))
                                 .padding(8.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
@@ -106,7 +106,7 @@ fun QuantumWarpView(
                                     text = "ACTIVE HARMONIC FREQUENCY:".uppercase(),
                                     fontSize = 10.sp,
                                     fontFamily = FontFamily.Monospace,
-                                    color = Color(currentEarth.primaryColor)
+                                    color = currentEarth.primaryColor
                                 )
                                 Text(
                                     text = currentEarth.displayName.uppercase(),
@@ -150,7 +150,7 @@ fun QuantumWarpView(
 
                 ParallelEarth.entries.forEach { earth ->
                     val isCurrent = currentEarth == earth
-                    CyberCard(borderColor = if (isCurrent) QuantumNeonGreen else Color(earth.primaryColor)) {
+                    CyberCard(borderColor = if (isCurrent) QuantumNeonGreen else earth.primaryColor) {
                         Column(modifier = Modifier.fillMaxWidth()) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -162,7 +162,7 @@ fun QuantumWarpView(
                                     fontFamily = FontFamily.Monospace,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 14.sp,
-                                    color = Color(earth.primaryColor)
+                                    color = earth.primaryColor
                                 )
                                 if (isCurrent) {
                                     Text(
@@ -210,7 +210,7 @@ fun QuantumWarpView(
                                 CyberButton(
                                     onClick = { viewModel.startWarpShift(earth) {} },
                                     text = "Initiate Warp Shift",
-                                    color = Color(earth.primaryColor),
+                                    color = earth.primaryColor,
                                     modifier = Modifier.fillMaxWidth().testTag("warp_btn_${earth.id}")
                                 )
                             }
@@ -527,7 +527,7 @@ fun QuantumWarpView(
                     color = QuantumLightText
                 )
 
-                CyberCard(borderColor = Color(currentEarth.primaryColor)) {
+                CyberCard(borderColor = currentEarth.primaryColor) {
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Text(
                             text = "Observe how companions' consciousnesses are split across timelines. Tap on a companion to inspect their alternative records:",
@@ -549,12 +549,12 @@ fun QuantumWarpView(
                                     modifier = Modifier
                                         .clickable { activeCompanionTab = name }
                                         .background(
-                                            if (isActive) Color(currentEarth.primaryColor).copy(alpha = 0.15f) else Color.Transparent,
+                                            if (isActive) currentEarth.primaryColor.copy(alpha = 0.15f) else Color.Transparent,
                                             RoundedCornerShape(4.dp)
                                         )
                                         .border(
                                             1.dp,
-                                            if (isActive) Color(currentEarth.primaryColor) else Color.Gray.copy(alpha = 0.3f),
+                                            if (isActive) currentEarth.primaryColor else Color.Gray.copy(alpha = 0.3f),
                                             RoundedCornerShape(4.dp)
                                         )
                                         .padding(horizontal = 14.dp, vertical = 6.dp)
@@ -632,8 +632,8 @@ fun QuantumWarpView(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(vertical = 4.dp)
-                                    .background(Color(npc.parallelEarth.primaryColor).copy(alpha = 0.05f), RoundedCornerShape(4.dp))
-                                    .border(1.dp, Color(npc.parallelEarth.primaryColor).copy(alpha = 0.25f), RoundedCornerShape(4.dp))
+                                    .background(npc.parallelEarth.primaryColor.copy(alpha = 0.05f), RoundedCornerShape(4.dp))
+                                    .border(1.dp, npc.parallelEarth.primaryColor.copy(alpha = 0.25f), RoundedCornerShape(4.dp))
                                     .padding(8.dp)
                             ) {
                                 Row(
@@ -653,7 +653,7 @@ fun QuantumWarpView(
                                             fontSize = 11.sp,
                                             fontWeight = FontWeight.Bold,
                                             fontFamily = FontFamily.Monospace,
-                                            color = Color(npc.parallelEarth.primaryColor)
+                                            color = npc.parallelEarth.primaryColor
                                         )
                                         Text(
                                             text = npc.role.uppercase() + " | " + npc.parallelEarth.displayName,

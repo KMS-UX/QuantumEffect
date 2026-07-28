@@ -510,7 +510,7 @@ fun ExploreScreen(
         obstacles.clear()
         
         // Seed Biome Obstacles & Interactive Objects from Master Tileset
-        val themeColor = Color(selectedBiome.color)
+        val themeColor = selectedBiome.color
         when (selectedBiome) {
             Biome.GRASSLANDS -> {
                 obstacles.add(IsoObstacle(1, "COLUMN", 110f, 150f, 18f, themeColor, name = "Aurelian Column"))
@@ -2789,7 +2789,7 @@ fun ExploreScreen(
             ) {
                 Biome.entries.forEach { b ->
                     val isSelected = selectedBiome == b
-                    val biomeColor = Color(b.color)
+                    val biomeColor = b.color
                     Box(
                         modifier = Modifier
                             .background(
@@ -2822,7 +2822,7 @@ fun ExploreScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .border(2.dp, Color(selectedBiome.color), RoundedCornerShape(12.dp))
+                    .border(2.dp, selectedBiome.color, RoundedCornerShape(12.dp))
                     .clip(RoundedCornerShape(12.dp))
                     .background(QuantumDarkBg)
             ) {
@@ -2951,11 +2951,11 @@ fun ExploreScreen(
                                     
                                     drawPath(
                                         path = path,
-                                        color = Color(selectedBiome.color).copy(alpha = 0.06f)
+                                        color = selectedBiome.color.copy(alpha = 0.06f)
                                     )
                                     drawPath(
                                         path = path,
-                                        color = Color(selectedBiome.color).copy(alpha = 0.28f),
+                                        color = selectedBiome.color.copy(alpha = 0.28f),
                                         style = Stroke(width = 1.dp.toPx())
                                     )
                                     
@@ -4574,7 +4574,7 @@ fun ExploreScreen(
                 ) {
                     Text(
                         text = "🛰️ ${selectedBiome.displayName.uppercase()}",
-                        color = Color(selectedBiome.color),
+                        color = selectedBiome.color,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace
@@ -4754,7 +4754,7 @@ fun ExploreScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 items(gameState.mapState) { poi ->
-                    val biomeColor = Color(poi.biome.color)
+                    val biomeColor = poi.biome.color
                     CyberCard(borderColor = if (poi.isCleared) QuantumBorder else biomeColor) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -6432,7 +6432,7 @@ fun FactionsScreen(
                             else -> ReputationTier.REVERED
                         }
 
-                        CyberCard(borderColor = Color(faction.color)) {
+                        CyberCard(borderColor = faction.color) {
                             Column(modifier = Modifier.fillMaxWidth()) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
@@ -6445,7 +6445,7 @@ fun FactionsScreen(
                                             fontSize = 17.sp,
                                             fontFamily = FontFamily.Monospace,
                                             fontWeight = FontWeight.Bold,
-                                            color = Color(faction.color)
+                                            color = faction.color
                                         )
                                         Text(
                                             text = "Base Coordinate: ${faction.baseLocation}",
@@ -6454,7 +6454,7 @@ fun FactionsScreen(
                                         )
                                     }
 
-                                    val tierColor = Color(tier.color)
+                                    val tierColor = tier.color
                                     Text(
                                         text = tier.title.uppercase(),
                                         color = tierColor,
@@ -6494,7 +6494,7 @@ fun FactionsScreen(
                                     progress = (points + 1000f) / 2000f, // Map -1000..1000 to 0..1
                                     label = "STAND STANDING",
                                     valueText = "$points / 1000 FP",
-                                    color = Color(faction.color)
+                                    color = faction.color
                                 )
 
                                 // --- FACTION VENDOR SECTION ---
@@ -6528,8 +6528,8 @@ fun FactionsScreen(
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .background(if (points >= repThreshold) Color(faction.color).copy(alpha = 0.08f) else Color.DarkGray.copy(alpha = 0.1f))
-                                        .border(1.dp, if (points >= repThreshold) Color(faction.color) else Color.Gray, RoundedCornerShape(4.dp))
+                                        .background(if (points >= repThreshold) faction.color.copy(alpha = 0.08f) else Color.DarkGray.copy(alpha = 0.1f))
+                                        .border(1.dp, if (points >= repThreshold) faction.color else Color.Gray, RoundedCornerShape(4.dp))
                                         .padding(8.dp),
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
@@ -6539,7 +6539,7 @@ fun FactionsScreen(
                                             text = "FACTION ARMORY VENDOR:",
                                             fontSize = 9.sp,
                                             fontFamily = FontFamily.Monospace,
-                                            color = if (points >= repThreshold) Color(faction.color) else Color.Gray,
+                                            color = if (points >= repThreshold) faction.color else Color.Gray,
                                             fontWeight = FontWeight.Bold
                                         )
                                         Text(
@@ -6569,7 +6569,7 @@ fun FactionsScreen(
                                                 viewModel.purchaseFactionItem(faction.name, itemToUnlock, itemPrice, repThreshold)
                                             },
                                             text = "PURCHASE",
-                                            color = Color(faction.color),
+                                            color = faction.color,
                                             modifier = Modifier.width(90.dp),
                                             enabled = points >= repThreshold && gameState.credits >= itemPrice
                                         )
@@ -6598,7 +6598,7 @@ fun FactionsScreen(
                                             viewModel.completePOIMission("Solis Prime Sector")
                                         },
                                         text = "Tactical Intel",
-                                        color = Color(faction.color),
+                                        color = faction.color,
                                         modifier = Modifier.weight(1f)
                                     )
                                     CyberButton(
@@ -6606,7 +6606,7 @@ fun FactionsScreen(
                                             viewModel.completePOIMission("Frontier Smuggling Node")
                                         },
                                         text = "Raw Materials",
-                                        color = Color(faction.color),
+                                        color = faction.color,
                                         modifier = Modifier.weight(1f)
                                     )
                                 }
@@ -7203,7 +7203,7 @@ fun FactionDialogueMatrixView(
                 diplomats.forEachIndexed { idx, dip ->
                     val isSelected = idx == selectedDiplomatIndex
                     val dipRep = gameState.factionReputations[dip.faction] ?: 0
-                    val dipColor = Color(dip.faction.color)
+                    val dipColor = dip.faction.color
 
                     Box(
                         modifier = Modifier
@@ -7265,7 +7265,7 @@ fun FactionDialogueMatrixView(
         }
 
         item {
-            val factionColor = Color(currentDiplomat.faction.color)
+            val factionColor = currentDiplomat.faction.color
             CyberCard(borderColor = factionColor) {
                 Column(
                     modifier = Modifier
@@ -7298,14 +7298,14 @@ fun FactionDialogueMatrixView(
                         }
                         Text(
                             text = "TIER: ${currentTier.title.uppercase()}",
-                            color = Color(currentTier.color),
+                            color = currentTier.color,
                             fontSize = 9.sp,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold
                         )
                     }
 
-                    val diplomatColor = Color(currentDiplomat.faction.color)
+                    val diplomatColor = currentDiplomat.faction.color
 
                     Spacer(modifier = Modifier.height(10.dp))
 
@@ -7430,7 +7430,7 @@ fun FactionDialogueMatrixView(
                                 )
                                 .border(
                                     width = 1.dp,
-                                    color = if (isChoiceEnabled) Color(currentDiplomat.faction.color).copy(alpha = 0.4f) else Color.Gray.copy(alpha = 0.2f),
+                                    color = if (isChoiceEnabled) currentDiplomat.faction.color.copy(alpha = 0.4f) else Color.Gray.copy(alpha = 0.2f),
                                     shape = RoundedCornerShape(6.dp)
                                 )
                                 .clickable(enabled = isChoiceEnabled) {
@@ -7522,7 +7522,7 @@ fun FactionDialogueMatrixView(
                                 } else {
                                     Text(
                                         text = "➤",
-                                        color = Color(currentDiplomat.faction.color),
+                                        color = currentDiplomat.faction.color,
                                         fontSize = 14.sp,
                                         fontFamily = FontFamily.Monospace,
                                         fontWeight = FontWeight.Bold
@@ -9533,7 +9533,7 @@ fun CombatScreen(
                             text = "> ${log.text}",
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,
-                            color = Color(log.color),
+                            color = log.color,
                             lineHeight = 14.sp,
                             modifier = Modifier.padding(vertical = 2.dp)
                         )
@@ -9663,7 +9663,7 @@ fun CombatScreen(
                                     Card(
                                         modifier = Modifier
                                             .width(130.dp)
-                                            .border(1.dp, Color(skill.color).copy(alpha = 0.5f))
+                                            .border(1.dp, skill.color.copy(alpha = 0.5f))
                                             .clickable {
                                                 viewModel.executePlayerSkill(skill)
                                             },
@@ -9675,7 +9675,7 @@ fun CombatScreen(
                                                 fontSize = 11.sp,
                                                 fontFamily = FontFamily.Monospace,
                                                 fontWeight = FontWeight.Bold,
-                                                color = Color(skill.color)
+                                                color = skill.color
                                             )
                                             Text(
                                                 text = "${skill.mpCost} MP",
