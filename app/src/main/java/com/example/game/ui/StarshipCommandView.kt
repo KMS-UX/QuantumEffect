@@ -382,7 +382,7 @@ fun BridgeControlPanel(
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(sys.icon, modifier = Modifier.padding(end = 6.dp))
-                                Text(sys.displayName, color = Color(sys.color), fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                                Text(sys.displayName, color = sys.color, fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                             }
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
@@ -627,7 +627,7 @@ fun GalaxyNavigationPanel(
                             .offset(x = (screenX - (finalNodeSize.value / 2f)).dp, y = (screenY - (finalNodeSize.value / 2f)).dp)
                             .size(finalNodeSize)
                             .background(
-                                if (isCurrent) QuantumNeonOrange else Color(sys.associatedReality.primaryColor),
+                                if (isCurrent) QuantumNeonOrange else sys.associatedReality.primaryColor,
                                 RoundedCornerShape(10.dp)
                             )
                             .border(
@@ -690,7 +690,7 @@ fun GalaxyNavigationPanel(
                                 Box(
                                     modifier = Modifier
                                         .size(8.dp)
-                                        .background(Color(sys.associatedReality.primaryColor), RoundedCornerShape(4.dp))
+                                        .background(sys.associatedReality.primaryColor, RoundedCornerShape(4.dp))
                                         .padding(end = 4.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))

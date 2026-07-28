@@ -21,10 +21,15 @@ private val DarkColorScheme = darkColorScheme(
 
 private val LightColorScheme = DarkColorScheme
 
+/**
+ * Dynamic color is off by default: the game's identity is the fixed neon
+ * cyberpunk palette, and letting Android 12+ substitute the device wallpaper
+ * scheme washes it out.
+ */
 @Composable
 fun MyApplicationTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true,
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {
