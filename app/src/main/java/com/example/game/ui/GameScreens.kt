@@ -867,6 +867,11 @@ fun ExploreScreen(
                 }
                 
                 // 3. Projectile & particle updates
+                // Impact effects spawned during this pass are buffered rather than
+                // appended directly: `particles` is being iterated, and structurally
+                // modifying a SnapshotStateList mid-iteration throws
+                // ConcurrentModificationException on the next hasNext().
+                val spawnedParticles = mutableListOf<IsoParticle>()
                 val pIter = particles.iterator()
                 while (pIter.hasNext()) {
                     val p = pIter.next()
@@ -907,7 +912,7 @@ fun ExploreScreen(
                                 
                                 // Splash particles on hit
                                 for (k in 0..5) {
-                                    particles.add(
+                                    spawnedParticles.add(
                                         IsoParticle(
                                             x = enemy.x,
                                             y = enemy.y,
@@ -942,7 +947,7 @@ fun ExploreScreen(
                                         
                                         // spark hit particles
                                         for (k in 0..4) {
-                                            particles.add(
+                                            spawnedParticles.add(
                                                 IsoParticle(p.x, p.y, Random.nextFloat() * 80f - 40f, Random.nextFloat() * 80f - 40f, obs.color, 4f, 1f, 10)
                                             )
                                         }
@@ -985,7 +990,7 @@ fun ExploreScreen(
                                     }
                                     
                                     for (k in 0..6) {
-                                        particles.add(IsoParticle(wildlife.x, wildlife.y, Random.nextFloat() * 100f - 50f, Random.nextFloat() * 100f - 50f, wildlife.color, 5f, 1f, 12))
+                                        spawnedParticles.add(IsoParticle(wildlife.x, wildlife.y, Random.nextFloat() * 100f - 50f, Random.nextFloat() * 100f - 50f, wildlife.color, 5f, 1f, 12))
                                     }
                                     
                                     damageNumbers.add(IsoDamageNumber(System.nanoTime(), "💥 Harvest: $dropItem", wildlife.x, wildlife.y - 12f, QuantumNeonGreen))
@@ -1059,7 +1064,7 @@ fun ExploreScreen(
                                 )
                                 // Spark hit particles
                                 for (k in 0..4) {
-                                    particles.add(
+                                    spawnedParticles.add(
                                         IsoParticle(
                                             x = playerX,
                                             y = playerY,
@@ -1092,6 +1097,7 @@ fun ExploreScreen(
                         }
                     }
                 }
+                particles.addAll(spawnedParticles)
                 
                 // 4. Floating texts
                 val dIter = damageNumbers.iterator()
